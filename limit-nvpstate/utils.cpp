@@ -1,136 +1,192 @@
-#include <QMessageBox>
+#include <utils.h>
+#include <log.h>
+
 #include <Shlwapi.h>
-#include <Psapi.h>
-#include <tlhelp32.h>
+#include <vector>
 
-std::string KEY_PATH_RUN = "SOFTWARE\\Wow6432Node\\Microsoft\\Windows\\CurrentVersion\\Run";
-std::string KEY_NAME_RUN = "limit-nvpstate";
+namespace {
 
-std::string getBasePath(std::string path) {
-    // find last occurrence of backslash
-    size_t backslashPos = path.find_last_of("\\/");
+// The original hardcoded SOFTWARE\Wow6432Node\... which is the 32-bit redirected
+// view. Addressing Wow6432Node directly is explicitly discouraged; use the real
+// path and select the view with KEY_WOW64_64KEY.
+constexpr wchar_t KEY_PATH_RUN[] = L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run";
+constexpr wchar_t KEY_NAME_RUN[] = L"limit-nvpstate";
 
-    if (backslashPos == std::string::npos) {
-        // no backslash found
-        return "";
+HKEY openRunKey(REGSAM access) {
+    HKEY hKey = nullptr;
+
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, KEY_PATH_RUN, 0, access | KEY_WOW64_64KEY, &hKey) != ERROR_SUCCESS) {
+        LOG(L"error: could not open the Run key (%lu)\n", GetLastError());
+        return nullptr;
     }
 
-    return path.substr(0, backslashPos);
+    return hKey;
 }
 
-std::string getProgramPath() {
-    char path[MAX_PATH];
+} // namespace
 
-    if (GetModuleFileNameA(NULL, path, MAX_PATH) != 0) {
-        return std::string(path);
-    } else {
-        return "";
+std::wstring getProgramPath() {
+    std::wstring path(MAX_PATH, L'\0');
+
+    for (;;) {
+        const DWORD written = GetModuleFileNameW(nullptr, path.data(), static_cast<DWORD>(path.size()));
+
+        if (written == 0) {
+            return std::wstring();
+        }
+
+        if (written < path.size()) {
+            path.resize(written);
+            return path;
+        }
+
+        if (path.size() >= 32768) {
+            return std::wstring();
+        }
+
+        path.resize(path.size() * 2);
     }
+}
+
+std::wstring getProgramDirectory() {
+    std::wstring path = getProgramPath();
+
+    const size_t separator = path.find_last_of(L"\\/");
+
+    if (separator == std::wstring::npos) {
+        return std::wstring();
+    }
+
+    path.resize(separator);
+    return path;
+}
+
+const wchar_t* getBaseName(const wchar_t* fullPath) {
+    return fullPath ? PathFindFileNameW(fullPath) : L"";
 }
 
 bool isAddedToStartup() {
-    HKEY hKey;
+    HKEY hKey = openRunKey(KEY_QUERY_VALUE);
 
-    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, KEY_PATH_RUN.c_str(), 0, KEY_READ, &hKey) != 0) {
-        QMessageBox::critical(nullptr, "limit-nvpstate", "Error: Failed to open key");
-        exit(1);
+    if (!hKey) {
+        return false;
     }
 
-    DWORD dataType;
-    int result = RegQueryValueExA(hKey, KEY_NAME_RUN.c_str(), nullptr, &dataType, nullptr, nullptr);
-
+    const LSTATUS result = RegQueryValueExW(hKey, KEY_NAME_RUN, nullptr, nullptr, nullptr, nullptr);
     RegCloseKey(hKey);
 
-    return result == 0;
+    return result == ERROR_SUCCESS;
 }
 
-int addToStartup(bool isEnabled) {
-    HKEY hKey;
+bool addToStartup(bool isEnabled) {
+    HKEY hKey = openRunKey(KEY_SET_VALUE);
 
-    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, KEY_PATH_RUN.c_str(), 0, KEY_SET_VALUE, &hKey) != 0) {
-        QMessageBox::critical(nullptr, "limit-nvpstate", "Error: Failed to open key");
-        exit(1);
+    if (!hKey) {
+        return false;
     }
 
-    std::string programPath = getProgramPath();
+    LSTATUS result;
 
-    int result;
     if (isEnabled) {
-        result = RegSetValueExA(hKey, KEY_NAME_RUN.c_str(), 0, REG_SZ, (const BYTE*)programPath.c_str(), programPath.size() + 1);
+        // Quote the path. An unquoted value containing spaces (anything under
+        // "C:\Program Files\...") is parsed incorrectly the moment an argument
+        // is appended, and is a classic unquoted-service-path style problem.
+        const std::wstring value = L"\"" + getProgramPath() + L"\"";
+
+        result = RegSetValueExW(hKey,
+                                KEY_NAME_RUN,
+                                0,
+                                REG_SZ,
+                                reinterpret_cast<const BYTE*>(value.c_str()),
+                                static_cast<DWORD>((value.size() + 1) * sizeof(wchar_t)));
     } else {
-        result = RegDeleteValueA(hKey, KEY_NAME_RUN.c_str());
-    }
+        result = RegDeleteValueW(hKey, KEY_NAME_RUN);
 
-    RegCloseKey(hKey);
-
-    return result;
-}
-
-std::string toLower(std::string str) {
-    std::string lowerString = str;
-
-    std::transform(lowerString.begin(), lowerString.end(), lowerString.begin(),
-        [](unsigned char c) { return std::tolower(c); });
-
-    return lowerString;
-}
-
-std::string getBaseName(std::string& fullPath) {
-    LPCSTR path = fullPath.c_str();
-    LPCSTR executableName = PathFindFileNameA(path);
-    return std::string(executableName);
-}
-
-std::string wStringToString(const std::wstring& wstr) {
-    // get required buffer size for the multi-byte str, excluding the null terminator
-    int requiredSize = WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), -1, NULL, 0, NULL, NULL);
-
-    if (requiredSize == 0) {
-        return "";
-    }
-
-    // create string with the correct size, excluding the null terminator
-    std::string str(requiredSize - 1, '\0'); // subtract 1 to exclude the null terminator
-    WideCharToMultiByte(CP_UTF8, 0, wstr.c_str(), -1, &str[0], requiredSize, NULL, NULL);
-    return str;
-}
-
-std::string getProcessNameByPID(DWORD pid) {
-    // attempt to get process name with OpenProcess
-    // this will fail for protected processes
-    HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
-
-    if (hProcess) {
-        char executableName[MAX_PATH];
-        int result = GetModuleBaseNameA(hProcess, nullptr, executableName, MAX_PATH);
-        CloseHandle(hProcess);
-
-        if (result > 0) {
-            return executableName;
+        if (result == ERROR_FILE_NOT_FOUND) {
+            result = ERROR_SUCCESS;
         }
     }
 
-    // fallback for protected processes
-    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    RegCloseKey(hKey);
 
-    if (!hSnapshot) {
-        return "";
+    return result == ERROR_SUCCESS;
+}
+
+bool getProcessNameByPID(DWORD pid, wchar_t* out, size_t cch) {
+    if (!out || cch == 0) {
+        return false;
     }
 
-    std::string processName = "";
+    out[0] = L'\0';
 
-    PROCESSENTRY32 processEntry;
-    processEntry.dwSize = sizeof(PROCESSENTRY32);
-
-    if (Process32First(hSnapshot, &processEntry)) {
-        do {
-            if (processEntry.th32ProcessID == pid) {
-                processName = wStringToString(processEntry.szExeFile);
-                break;
-            }
-        } while (Process32Next(hSnapshot, &processEntry));
+    if (pid == 0) {
+        return false;
     }
 
-    CloseHandle(hSnapshot);
-    return processName;
+    // PROCESS_QUERY_LIMITED_INFORMATION succeeds against protected and elevated
+    // processes where PROCESS_QUERY_INFORMATION | PROCESS_VM_READ fails, and
+    // QueryFullProcessImageNameW does not need the module list to be readable.
+    //
+    // Between them this removes the CreateToolhelp32Snapshot fallback the
+    // original needed -- a full system process snapshot that could fire on an
+    // ordinary alt-tab.
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+
+    if (!hProcess) {
+        return false;
+    }
+
+    wchar_t fullPath[MAX_PATH];
+    DWORD   size = MAX_PATH;
+
+    if (QueryFullProcessImageNameW(hProcess, 0, fullPath, &size)) {
+        CloseHandle(hProcess);
+        return wcscpy_s(out, cch, PathFindFileNameW(fullPath)) == 0;
+    }
+
+    // Rare: paths longer than MAX_PATH.
+    if (GetLastError() == ERROR_INSUFFICIENT_BUFFER) {
+        std::vector<wchar_t> buffer(32768);
+        size = static_cast<DWORD>(buffer.size());
+
+        if (QueryFullProcessImageNameW(hProcess, 0, buffer.data(), &size)) {
+            CloseHandle(hProcess);
+            return wcscpy_s(out, cch, PathFindFileNameW(buffer.data())) == 0;
+        }
+    }
+
+    CloseHandle(hProcess);
+    return false;
+}
+
+std::string wideToUtf8(const wchar_t* str) {
+    if (!str || !*str) {
+        return std::string();
+    }
+
+    const int size = WideCharToMultiByte(CP_UTF8, 0, str, -1, nullptr, 0, nullptr, nullptr);
+
+    if (size <= 1) {
+        return std::string();
+    }
+
+    std::string out(static_cast<size_t>(size) - 1, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, str, -1, out.data(), size, nullptr, nullptr);
+    return out;
+}
+
+std::wstring utf8ToWide(const char* str) {
+    if (!str || !*str) {
+        return std::wstring();
+    }
+
+    const int size = MultiByteToWideChar(CP_UTF8, 0, str, -1, nullptr, 0);
+
+    if (size <= 1) {
+        return std::wstring();
+    }
+
+    std::wstring out(static_cast<size_t>(size) - 1, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, str, -1, out.data(), size);
+    return out;
 }

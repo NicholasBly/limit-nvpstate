@@ -66,6 +66,9 @@
     <ClInclude Include="nvidia.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="log.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <CopyFileToFolders Include="config.json" />
@@ -89,5 +92,10 @@
     <QtUic Include="about.ui">
       <Filter>Form Files</Filter>
     </QtUic>
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="icon.png">
+      <Filter>Resource Files</Filter>
+    </None>
   </ItemGroup>
 </Project>
