@@ -63,7 +63,7 @@
          </column>
          <column>
           <property name="text">
-           <string>When behind</string>
+           <string>Per-app</string>
           </property>
          </column>
         </widget>
