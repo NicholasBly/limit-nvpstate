@@ -21,6 +21,9 @@ public:
     // Releases the limit on every GPU we may have touched. Safe to call twice.
     void releaseLimits();
 
+    // Show, un-minimise and focus the window (tray click, second launch).
+    void bringToFront();
+
     // Ordered teardown: stop triggers, release limits, remove the tray icon,
     // then leave the event loop.
     void shutdown(int exitCode);

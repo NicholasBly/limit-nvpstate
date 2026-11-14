@@ -24,12 +24,16 @@ std::wstring getProgramDirectory();
 const wchar_t* getBaseName(const wchar_t* fullPath);
 
 // HKLM\...\Run entry management. Both return false on failure rather than
-// terminating the process, which is what the original did.
+// terminating the process, which is what the original did. Both look at the
+// 64-bit view and at the 32-bit (Wow6432Node) view that 5.2.1 and earlier
+// wrote to, so an upgraded install is seen, cleaned up and never duplicated.
 bool isAddedToStartup();
 bool addToStartup(bool isEnabled);
 
 // Writes the base filename of the image backing `pid` into `out`.
-// Returns false if the process could not be opened or queried.
+// Tries a limited-access handle first, then a process snapshot (for processes
+// that refuse OpenProcess, e.g. games protected by anti-cheat).
+// Returns false if neither found the process.
 bool getProcessNameByPID(DWORD pid, wchar_t* out, size_t cch);
 
 std::string  wideToUtf8(const wchar_t* str);

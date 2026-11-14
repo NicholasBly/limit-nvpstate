@@ -418,11 +418,8 @@ SessionEndFilter* sessionEndFilter = nullptr;
 // ===========================================================================
 
 limitnvpstate::limitnvpstate(QWidget* parent) : QMainWindow(parent) {
+    // No per-window icon: every window uses the application icon set in main().
     ui.setupUi(this);
-
-    // The .ui file declares the window icon with <iconset theme="...">, which
-    // generates QIcon::fromTheme() and always returns a null icon on Windows.
-    setWindowIcon(QIcon(":/limitnvpstate/icon.png"));
 }
 
 limitnvpstate::~limitnvpstate() {
@@ -563,8 +560,11 @@ bool limitnvpstate::init() {
     {
         int pollMs = config["process_running_polling"].get<int>();
 
+        // Bad configs must neither spin the loop nor park it for weeks.
         if (pollMs < 100) {
-            pollMs = 100;   // do not let a bad config spin the poll loop
+            pollMs = 100;
+        } else if (pollMs > 600000) {
+            pollMs = 600000;
         }
 
         settingPollMs.store(pollMs);
@@ -635,11 +635,15 @@ void limitnvpstate::createTrayIcon() {
         if (isVisible()) {
             hide();
         } else {
-            showNormal();
-            raise();
-            activateWindow();
+            bringToFront();
         }
     });
+}
+
+void limitnvpstate::bringToFront() {
+    showNormal();
+    raise();
+    activateWindow();
 }
 
 void limitnvpstate::startTrigger(int trigger) {
@@ -761,9 +765,19 @@ bool limitnvpstate::getAvailablePStates() {
 
     int matchRow = -1;
 
-    // Index 0 is P0, which is the unlimited state and not a valid limit.
-    for (NvU32 i = 1; i < pStatesInfo.numPstates; i++) {
+    // P0 is the unlimited state, not a valid limit. Skip it by id rather than
+    // assuming it is entry 0, and never trust the driver's count past the
+    // array the struct actually has.
+    const NvU32 count = pStatesInfo.numPstates < NVAPI_MAX_GPU_PSTATE20_PSTATES
+                            ? pStatesInfo.numPstates
+                            : NVAPI_MAX_GPU_PSTATE20_PSTATES;
+
+    for (NvU32 i = 0; i < count; i++) {
         const int pstate = static_cast<int>(pStatesInfo.pstates[i].pstateId);
+
+        if (pstate == NVAPI_GPU_PERF_PSTATE_P0) {
+            continue;
+        }
 
         ui.selectedPState->addItem(QStringLiteral("P%1").arg(pstate));
 
