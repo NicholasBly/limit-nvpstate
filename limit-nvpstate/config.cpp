@@ -9,7 +9,7 @@ nlohmann::json config;
 
 namespace {
 
-// Cap: config.json is six scalars. Anything larger is not our file.
+// Cap: config.json is a handful of settings. Anything larger is not our file.
 constexpr long long MAX_CONFIG_BYTES = 1 << 20;
 
 std::wstring configPath;
@@ -85,7 +85,8 @@ nlohmann::json defaultConfig() {
         { "pstate_limit",            8                       },
         { "start_minimized",         false                   },
         { "unlimit_trigger",         0                       },
-        { "process_running_polling", 5000                    }
+        { "process_running_polling", 5000                    },
+        { "process_background_pstates", nlohmann::json::object() }
     };
 }
 
@@ -97,6 +98,7 @@ bool sameKind(const nlohmann::json& a, const nlohmann::json& b) {
     if (a.is_boolean() && b.is_boolean()) return true;
     if (a.is_array()   && b.is_array())   return true;
     if (a.is_string()  && b.is_string())  return true;
+    if (a.is_object()  && b.is_object())  return true;
     return false;
 }
 

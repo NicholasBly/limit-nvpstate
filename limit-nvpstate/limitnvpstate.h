@@ -2,7 +2,11 @@
 
 #include <ui_limitnvpstate.h>
 
+#include <vector>
+
+class QComboBox;
 class QSystemTrayIcon;
+class QTreeWidgetItem;
 
 class limitnvpstate : public QMainWindow {
     Q_OBJECT
@@ -33,9 +37,21 @@ private:
     Ui::limitnvpstateClass ui;
     QSystemTrayIcon*       trayIcon = nullptr;
 
+    // Limitable P-States of the selected GPU (P0 excluded), in driver order.
+    std::vector<int> availablePStates;
+
     bool fail(const char* message);
     void createTrayIcon();
     void saveProcessExceptions();
+
+    // One exception-list row: the exe name plus its "When behind" combo.
+    void addProcessRow(const QString& name, int background);
+    void fillBackgroundCombo(QComboBox* combo, int background) const;
+    int  backgroundOf(QTreeWidgetItem* item) const;
+
+    // After the GPU changes: rebuild every row's combo for the new GPU's
+    // states, snapping values it does not offer. Saves if anything moved.
+    void refreshBackgroundCombos();
 
     // Fills the Limit P-State combo for one GPU and publishes the selection.
     // Returns false (after showing an error) if NVAPI cannot list its states.

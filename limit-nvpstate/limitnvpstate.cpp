@@ -14,13 +14,14 @@
 #include <QComboBox>
 #include <QFileDialog>
 #include <QFileInfo>
+#include <QHeaderView>
 #include <QIcon>
-#include <QListWidget>
 #include <QMenu>
 #include <QMessageBox>
 #include <QPushButton>
 #include <QSignalBlocker>
 #include <QSystemTrayIcon>
+#include <QTreeWidget>
 
 #include <tlhelp32.h>
 
@@ -63,6 +64,10 @@ constexpr int     UNLIMIT_TRIGGER_COUNT = static_cast<int>(std::size(UNLIMIT_TRI
 // whose last NVAPI call failed (state unknown, so always retry and release).
 constexpr int APPLIED_NEVER   = -1;
 constexpr int APPLIED_UNKNOWN = -2;
+
+const char* const BACKGROUND_TOOLTIP =
+    "P-State to use while this program is open but not in front.\n"
+    "Default: Running trigger = Unlimited, Foreground trigger = the Limit P-State.";
 
 // WaitForMultipleObjects takes 64 handles; two are the stop and wake events.
 constexpr size_t MAX_WAIT_PROCESSES = MAXIMUM_WAIT_OBJECTS - 2;
@@ -580,6 +585,54 @@ void publishEntries(std::vector<ProcessEntry> updated) {
 }
 
 // ---------------------------------------------------------------------------
+// Exception list rows (GUI thread)
+// ---------------------------------------------------------------------------
+
+int rowBackground(const QTreeWidget* list, QTreeWidgetItem* item) {
+    const QComboBox* combo = qobject_cast<QComboBox*>(list->itemWidget(item, 1));
+
+    return combo ? combo->currentData().toInt() : policy::BACKGROUND_DEFAULT;
+}
+
+// Reads every row and writes both config keys. Returns the rows as entries.
+std::vector<ProcessEntry> writeProcessConfig(const QTreeWidget* list) {
+    nlohmann::json            names     = nlohmann::json::array();
+    nlohmann::json            overrides = nlohmann::json::object();
+    std::vector<ProcessEntry> entries;
+
+    const int rows = list->topLevelItemCount();
+    entries.reserve(static_cast<size_t>(rows));
+
+    for (int i = 0; i < rows; i++) {
+        QTreeWidgetItem* item       = list->topLevelItem(i);
+        std::wstring     name       = item->text(0).toStdWString();
+        const int        background = rowBackground(list, item);
+
+        if (name.empty()) {
+            continue;
+        }
+
+        const std::string utf8 = wideToUtf8(name.c_str());
+
+        // Names stay a plain string array, exactly as before, so older builds
+        // still read this config; they just ignore the overrides object.
+        names.push_back(utf8);
+
+        if (background != policy::BACKGROUND_DEFAULT) {
+            overrides[utf8] = background;
+        }
+
+        entries.push_back({ std::move(name), background, false });
+    }
+
+    config["process_exceptions"]         = std::move(names);
+    config["process_background_pstates"] = std::move(overrides);
+    saveConfig();
+
+    return entries;
+}
+
+// ---------------------------------------------------------------------------
 // Session end
 // ---------------------------------------------------------------------------
 
@@ -771,7 +824,16 @@ bool limitnvpstate::init() {
 
     // ---- Process exception list ----
     {
+        QHeaderView* header = ui.processExceptionsList->header();
+        header->setStretchLastSection(false);
+        header->setSectionResizeMode(0, QHeaderView::Stretch);
+        header->setSectionResizeMode(1, QHeaderView::ResizeToContents);
+        ui.processExceptionsList->headerItem()->setToolTip(1, QString::fromLatin1(BACKGROUND_TOOLTIP));
+
+        const nlohmann::json& overrides = config["process_background_pstates"];
+
         std::vector<ProcessEntry> parsed;
+        bool                      repaired = false;
 
         for (const auto& entry : config["process_exceptions"]) {
             if (!entry.is_string()) {
@@ -784,11 +846,39 @@ bool limitnvpstate::init() {
                 continue;
             }
 
-            ui.processExceptionsList->addItem(QString::fromStdWString(name));
-            parsed.push_back({ std::move(name), policy::BACKGROUND_DEFAULT, false });
+            // Case-insensitive, like Windows file names, so a hand-edited key
+            // in different case still applies.
+            int background = policy::BACKGROUND_DEFAULT;
+
+            for (auto it = overrides.begin(); it != overrides.end(); ++it) {
+                if (!sameName(name, utf8ToWide(it.key().c_str()).c_str())) {
+                    continue;
+                }
+
+                const nlohmann::json& value = it.value();
+                const bool            isInt = value.is_number_integer();
+
+                background = policy::sanitizeBackground(isInt, isInt ? value.get<long long>() : 0);
+
+                // Default is never written, so a stored key that comes back as
+                // Default was garbage: drop it from the file.
+                repaired |= background == policy::BACKGROUND_DEFAULT;
+                break;
+            }
+
+            const int snapped = policy::snapToAvailable(background, availablePStates);
+            repaired |= snapped != background;
+
+            addProcessRow(QString::fromStdWString(name), snapped);
+            parsed.push_back({ std::move(name), snapped, false });
         }
 
         publishEntries(std::move(parsed));
+
+        // A sanitised or snapped value: store what is actually in use.
+        if (repaired) {
+            writeProcessConfig(ui.processExceptionsList);
+        }
     }
 
     connect(ui.addProcess,    &QPushButton::clicked, this, &limitnvpstate::addProcess);
@@ -977,6 +1067,9 @@ bool limitnvpstate::getAvailablePStates(int gpuIndex) {
         return fail("Error: The GPU reported no limitable P-States");
     }
 
+    availablePStates = available;
+    refreshBackgroundCombos();
+
     // Rebuild without firing selectedPStateChanged for every intermediate state.
     QSignalBlocker blocker(ui.selectedPState);
 
@@ -1043,11 +1136,11 @@ void limitnvpstate::addProcess() {
         // MatchFixedString is case-insensitive. MatchExactly, which the original
         // used, is not -- so "Game.exe" and "game.exe" both got added despite
         // being the same file on Windows.
-        if (!ui.processExceptionsList->findItems(executableName, Qt::MatchFixedString).isEmpty()) {
+        if (!ui.processExceptionsList->findItems(executableName, Qt::MatchFixedString, 0).isEmpty()) {
             continue;
         }
 
-        ui.processExceptionsList->addItem(executableName);
+        addProcessRow(executableName, policy::BACKGROUND_DEFAULT);
         added = true;
     }
 
@@ -1057,43 +1150,82 @@ void limitnvpstate::addProcess() {
 }
 
 void limitnvpstate::removeProcess() {
-    const QList<QListWidgetItem*> selected = ui.processExceptionsList->selectedItems();
+    const QList<QTreeWidgetItem*> selected = ui.processExceptionsList->selectedItems();
 
     if (selected.isEmpty()) {
         return;
     }
 
-    for (QListWidgetItem* item : selected) {
-        delete ui.processExceptionsList->takeItem(ui.processExceptionsList->row(item));
-    }
+    // Deleting an item removes it from the tree, along with its combo.
+    qDeleteAll(selected);
 
     saveProcessExceptions();
 }
 
-void limitnvpstate::saveProcessExceptions() {
-    nlohmann::json            list = nlohmann::json::array();
-    std::vector<ProcessEntry> parsed;
+void limitnvpstate::addProcessRow(const QString& name, int background) {
+    QTreeWidgetItem* item  = new QTreeWidgetItem(ui.processExceptionsList, QStringList(name));
+    QComboBox*       combo = new QComboBox();
 
-    parsed.reserve(static_cast<size_t>(ui.processExceptionsList->count()));
+    combo->setToolTip(QString::fromLatin1(BACKGROUND_TOOLTIP));
+    fillBackgroundCombo(combo, background);
 
-    for (int i = 0; i < ui.processExceptionsList->count(); i++) {
-        std::wstring name = ui.processExceptionsList->item(i)->text().toStdWString();
+    ui.processExceptionsList->setItemWidget(item, 1, combo);
 
-        if (name.empty()) {
+    connect(combo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
+        if (index >= 0) {
+            saveProcessExceptions();
+        }
+    });
+}
+
+void limitnvpstate::fillBackgroundCombo(QComboBox* combo, int background) const {
+    QSignalBlocker blocker(combo);
+
+    combo->clear();
+    combo->addItem(QStringLiteral("Default"),   policy::BACKGROUND_DEFAULT);
+    combo->addItem(QStringLiteral("Unlimited"), policy::PSTATE_UNLIMITED);
+
+    for (int pstate : availablePStates) {
+        combo->addItem(QStringLiteral("P%1").arg(pstate), pstate);
+    }
+
+    const int row = combo->findData(background);
+    combo->setCurrentIndex(row >= 0 ? row : 0);
+}
+
+int limitnvpstate::backgroundOf(QTreeWidgetItem* item) const {
+    return rowBackground(ui.processExceptionsList, item);
+}
+
+void limitnvpstate::refreshBackgroundCombos() {
+    bool changed = false;
+
+    for (int i = 0; i < ui.processExceptionsList->topLevelItemCount(); i++) {
+        QTreeWidgetItem* item  = ui.processExceptionsList->topLevelItem(i);
+        QComboBox*       combo = qobject_cast<QComboBox*>(ui.processExceptionsList->itemWidget(item, 1));
+
+        if (!combo) {
             continue;
         }
 
-        list.push_back(wideToUtf8(name.c_str()));
-        parsed.push_back({ std::move(name), policy::BACKGROUND_DEFAULT, false });
+        const int current = backgroundOf(item);
+        const int snapped = policy::snapToAvailable(current, availablePStates);
+
+        fillBackgroundCombo(combo, snapped);
+        changed |= snapped != current;
     }
 
-    config["process_exceptions"] = std::move(list);
-    saveConfig();
+    if (changed) {
+        saveProcessExceptions();
+    }
+}
 
-    publishEntries(std::move(parsed));
+void limitnvpstate::saveProcessExceptions() {
+    publishEntries(writeProcessConfig(ui.processExceptionsList));
 
-    // Rescan with the new names now rather than at the next interval, and
-    // re-evaluate the current foreground against the new list.
+    // Rescan with the new names now rather than at the next interval, start
+    // or stop detectors if a row left or joined Default, and re-evaluate the
+    // current foreground against the new list.
     wakePoll();
     updateDetectors();
 }
