@@ -18,7 +18,8 @@ public:
     // the GPU clamped.
     bool init();
 
-    // Releases the limit on every GPU we may have touched. Safe to call twice.
+    // Releases the limit on every GPU we touched and stops any further
+    // limiting. Safe to call twice.
     void releaseLimits();
 
     // Show, un-minimise and focus the window (tray click, second launch).
@@ -34,9 +35,11 @@ private:
 
     bool fail(const char* message);
     void createTrayIcon();
-    void startTrigger(int trigger);
     void saveProcessExceptions();
-    bool getAvailablePStates();
+
+    // Fills the Limit P-State combo for one GPU and publishes the selection.
+    // Returns false (after showing an error) if NVAPI cannot list its states.
+    bool getAvailablePStates(int gpuIndex);
 
 private slots:
     void unlimitTriggerChanged(int index);

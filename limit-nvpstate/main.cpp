@@ -61,6 +61,14 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    // Qt's fallback session management closes every visible window at logoff
+    // and cancels the logoff if one refuses -- and ours always refuses, because
+    // closing hides to the tray. So an open window blocked logoff. Accepting
+    // that close instead is no better: Qt then destroys the native window, and
+    // WM_ENDSESSION, which releases the limits, never arrives. Turn it off.
+    // (Deprecated in Qt 5.15, gone in Qt 6 along with the behaviour itself.)
+    QGuiApplication::setFallbackSessionManagementEnabled(false);
+
     QApplication a(argc, argv);
 
     // This is a tray application. Without this, closing the About dialog while
