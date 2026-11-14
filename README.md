@@ -10,11 +10,11 @@ Note that closing the application by clicking "exit" in the tray menu will unlim
 
 Disclaimer: applications running in fullscreen mode (legacy flip), may not be detected when in the foreground. If this occurs, switch the unlimit trigger to running processes instead.
 
-## Per-program "When behind" P-State
+## Per-app P-State
 
-Each program in the exceptions list has a **When behind** dropdown. It sets the P-State to use while that program is open but not in front (alt-tabbed, minimized, behind another window). In front, a listed program is always unlimited.
+Each program in the exceptions list has a **Per-app** dropdown. It sets the P-State to use while that program is open but not in front (alt-tabbed, minimized, behind another window). In front, a listed program is always unlimited.
 
-Example: add `FortniteClient-Win64-Shipping.exe` (the game itself, not the Epic launcher) and set **When behind** to P3, with **Limit P-State** at P8:
+Example: add `FortniteClient-Win64-Shipping.exe` (the game itself, not the Epic launcher) and set **Per-app** to P3, with **Limit P-State** at P8:
 
 - Fortnite in front: unlimited (P0)
 - Fortnite open but behind: P3

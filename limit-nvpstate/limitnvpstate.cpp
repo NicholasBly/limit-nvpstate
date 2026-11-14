@@ -66,7 +66,8 @@ constexpr int APPLIED_NEVER   = -1;
 constexpr int APPLIED_UNKNOWN = -2;
 
 const char* const BACKGROUND_TOOLTIP =
-    "Overrides the default \"Limit P-State\" setting to set limits per-app.";
+    "Overrides the default \"Limit P-State\" setting to set limits per-app.\n"
+    "Applies while the app is open but not in front; in front it is always unlimited.";
 
 // WaitForMultipleObjects takes 64 handles; two are the stop and wake events.
 constexpr size_t MAX_WAIT_PROCESSES = MAXIMUM_WAIT_OBJECTS - 2;
