@@ -6,7 +6,6 @@
 
 class QComboBox;
 class QSystemTrayIcon;
-class QTreeWidgetItem;
 
 class limitnvpstate : public QMainWindow {
     Q_OBJECT
@@ -47,15 +46,19 @@ private:
     // One exception-list row: the exe name plus its "When behind" combo.
     void addProcessRow(const QString& name, int background);
     void fillBackgroundCombo(QComboBox* combo, int background) const;
-    int  backgroundOf(QTreeWidgetItem* item) const;
 
     // After the GPU changes: rebuild every row's combo for the new GPU's
     // states, snapping values it does not offer. Saves if anything moved.
     void refreshBackgroundCombos();
 
-    // Fills the Limit P-State combo for one GPU and publishes the selection.
-    // Returns false (after showing an error) if NVAPI cannot list its states.
-    bool getAvailablePStates(int gpuIndex);
+    // The GPU's limitable P-States (P0 excluded), in driver order. Returns
+    // false, after showing an error, if NVAPI cannot list them.
+    bool queryPStates(int gpuIndex, std::vector<int>& available);
+
+    // Shows them in the Limit P-State combo and the rows' "When behind"
+    // combos, with `selected` chosen. UI and config.json only: callers update
+    // the shared state themselves.
+    void showPStates(const std::vector<int>& available, int selected);
 
 private slots:
     void unlimitTriggerChanged(int index);

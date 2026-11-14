@@ -47,8 +47,9 @@ Missing entries are Default. Old builds ignore the key, so downgrading is safe.
 ## Builder's calls (not discussed, my defaults)
 
 - Per-row dropdown in a two-column list (Process | When behind); window widened.
-- If the GPU changes and a saved P-State doesn't exist on it, snap to the nearest
-  one it does have (same as the global limit already does).
+- If the GPU changes and a saved "When behind" P-State doesn't exist on it, snap
+  to the nearest one it does have, ties to the lower-power state, and save that.
+  (The global limit keeps its existing fallback: the GPU's deepest state.)
 - One shared state object behind one lock, so the poll thread and the GUI thread
   can't apply limits in the wrong order (also fixes the PR #11 races).
 - Branch `feature/per-exe-background-pstate` off the fork's `main`; PR #11 fixes

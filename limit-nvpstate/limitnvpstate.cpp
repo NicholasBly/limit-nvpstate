@@ -347,11 +347,16 @@ void stopForegroundHook() {
 // ---------------------------------------------------------------------------
 
 DWORD WINAPI pollProcesses(LPVOID) {
-    // This thread must never compete with a game for CPU.
-    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    // Normal priority on purpose. This thread sleeps nearly all the time, but
+    // it takes stateLock, and SRW locks have no priority inheritance: at
+    // below-normal priority, a game saturating every core could preempt it
+    // while it held the lock and stall the foreground hook (the alt-tab back
+    // into the game) for seconds.
 
-    std::vector<DWORD>  matchedPids;
-    std::vector<HANDLE> waits;
+    std::vector<std::wstring> names;         // copy of the list, matched without the lock
+    std::vector<char>         seen;          // per name: found in this snapshot
+    std::vector<DWORD>        matchedPids;
+    std::vector<HANDLE>       waits;
 
     matchedPids.reserve(MAX_WAIT_PROCESSES);
     waits.reserve(MAXIMUM_WAIT_OBJECTS);
@@ -364,45 +369,68 @@ DWORD WINAPI pollProcesses(LPVOID) {
         bool  unlimitedRunning = false;
         DWORD interval         = 5000;
 
+        {
+            StateGuard guard;
+
+            names.clear();
+
+            for (const ProcessEntry& entry : state.entries) {
+                names.push_back(entry.name);
+            }
+        }
+
+        seen.assign(names.size(), 0);
+
         // CreateToolhelp32Snapshot returns INVALID_HANDLE_VALUE on failure, not
-        // NULL.
+        // NULL. The walk happens without the lock: it is the slow part.
         HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
 
-        if (hSnapshot == INVALID_HANDLE_VALUE) {
+        if (hSnapshot != INVALID_HANDLE_VALUE) {
+            PROCESSENTRY32W processEntry = {};
+            processEntry.dwSize          = sizeof(processEntry);
+
+            if (Process32FirstW(hSnapshot, &processEntry)) {
+                do {
+                    for (size_t i = 0; i < names.size(); i++) {
+                        if (!sameName(names[i], processEntry.szExeFile)) {
+                            continue;
+                        }
+
+                        seen[i] = 1;
+
+                        if (matchedPids.size() < MAX_WAIT_PROCESSES) {
+                            matchedPids.push_back(processEntry.th32ProcessID);
+                        } else {
+                            truncated = true;
+                        }
+
+                        break;
+                    }
+                } while (Process32NextW(hSnapshot, &processEntry));
+            }
+
+            CloseHandle(hSnapshot);
+        } else {
             LOG(L"error: CreateToolhelp32Snapshot failed (%lu)\n", GetLastError());
         }
 
         {
             StateGuard guard;
 
-            // A failed snapshot keeps the last known flags rather than
-            // pretending everything just exited.
+            // Matched by name, so a list edited during the walk is fine: a new
+            // name reads as "not running" until the wake the edit sends. A
+            // failed snapshot keeps the last known flags rather than pretending
+            // everything just exited.
             if (hSnapshot != INVALID_HANDLE_VALUE) {
                 for (ProcessEntry& entry : state.entries) {
                     entry.running = false;
-                }
 
-                PROCESSENTRY32W processEntry = {};
-                processEntry.dwSize          = sizeof(processEntry);
-
-                if (Process32FirstW(hSnapshot, &processEntry)) {
-                    do {
-                        for (ProcessEntry& entry : state.entries) {
-                            if (!sameName(entry.name, processEntry.szExeFile)) {
-                                continue;
-                            }
-
+                    for (size_t i = 0; i < names.size(); i++) {
+                        if (seen[i] && sameName(names[i], entry.name.c_str())) {
                             entry.running = true;
-
-                            if (matchedPids.size() < MAX_WAIT_PROCESSES) {
-                                matchedPids.push_back(processEntry.th32ProcessID);
-                            } else {
-                                truncated = true;
-                            }
-
                             break;
                         }
-                    } while (Process32NextW(hSnapshot, &processEntry));
+                    }
                 }
             }
 
@@ -411,19 +439,15 @@ DWORD WINAPI pollProcesses(LPVOID) {
             interval         = state.pollMs;
         }
 
-        if (hSnapshot != INVALID_HANDLE_VALUE) {
-            CloseHandle(hSnapshot);
-        }
-
         if (!ok) {
             reportFatal("Error: Failed to set P-State");
             return 1;
         }
 
         // Wait for any matched process to exit (rescan straight away), a wake
-        // request (list edited) or shutdown. If something running already
-        // counts as Unlimited, nothing that starts could do better, so there
-        // is no need to rescan on a timer: zero CPU for the whole game
+        // request (list or trigger changed) or shutdown. If something running
+        // already counts as Unlimited, nothing that starts could do better, so
+        // there is no need to rescan on a timer: zero CPU for the whole game
         // session. That only holds if we can see every exit, though.
         waits.clear();
         waits.push_back(pollStopEvent);
@@ -434,12 +458,22 @@ DWORD WINAPI pollProcesses(LPVOID) {
         for (DWORD pid : matchedPids) {
             HANDLE hProcess = OpenProcess(SYNCHRONIZE, FALSE, pid);
 
-            if (hProcess) {
-                waits.push_back(hProcess);
-            } else {
+            if (!hProcess) {
                 LOG(L"warn: could not open pid %lu for synchronisation\n", pid);
                 watchingAll = false;
+                continue;
             }
+
+            // Already exited but still listed (another program holds a handle
+            // to it): waiting on it would wake at once, every time -- a busy
+            // loop. Leave it to the timer.
+            if (WaitForSingleObject(hProcess, 0) == WAIT_OBJECT_0) {
+                CloseHandle(hProcess);
+                watchingAll = false;
+                continue;
+            }
+
+            waits.push_back(hProcess);
         }
 
         const DWORD timeout = (unlimitedRunning && watchingAll && waits.size() > 2) ? INFINITE : interval;
@@ -582,6 +616,17 @@ void publishEntries(std::vector<ProcessEntry> updated) {
     }
 
     state.entries.swap(updated);
+}
+
+// The configured limit if this GPU offers it, otherwise its deepest state.
+int pickGlobalLimit(const std::vector<int>& available, int wanted) {
+    for (int pstate : available) {
+        if (pstate == wanted) {
+            return pstate;
+        }
+    }
+
+    return available.back();
 }
 
 // ---------------------------------------------------------------------------
@@ -779,8 +824,21 @@ bool limitnvpstate::init() {
             this, &limitnvpstate::selectedGPUChanged);
 
     // ---- P-State combo box ----
-    if (!getAvailablePStates(gpuIndex)) {
-        return false;
+    {
+        std::vector<int> available;
+
+        if (!queryPStates(gpuIndex, available)) {
+            return false;
+        }
+
+        const int limit = pickGlobalLimit(available, config["pstate_limit"].get<int>());
+
+        {
+            StateGuard guard;
+            state.globalLimit = limit;
+        }
+
+        showPStates(available, limit);
     }
 
     connect(ui.selectedPState, QOverload<int>::of(&QComboBox::currentIndexChanged),
@@ -843,6 +901,18 @@ bool limitnvpstate::init() {
             std::wstring name = utf8ToWide(entry.get<std::string>().c_str());
 
             if (name.empty()) {
+                continue;
+            }
+
+            // A hand-edited file may list the same exe twice in different case.
+            bool duplicate = false;
+
+            for (const ProcessEntry& existing : parsed) {
+                duplicate |= sameName(existing.name, name.c_str());
+            }
+
+            if (duplicate) {
+                repaired = true;
                 continue;
             }
 
@@ -950,6 +1020,11 @@ void limitnvpstate::unlimitTriggerChanged(int index) {
         state.trigger = static_cast<policy::Trigger>(index);
     }
 
+    // A poll thread that stays on may be parked without a timeout because a
+    // Default row counted as Unlimited under the old trigger. Under the new
+    // one it may not, so it must rescan and re-decide how to wait.
+    wakePoll();
+
     // Detectors that stay on keep their state; only what the new trigger
     // does not need is stopped. Then one evaluation from that known state.
     updateDetectors();
@@ -973,28 +1048,44 @@ void limitnvpstate::selectedGPUChanged(int index) {
 
     // The P-State list is per GPU. Read it before switching anything, so a
     // failure leaves the old GPU selected and working.
-    if (!getAvailablePStates(index)) {
+    std::vector<int> available;
+
+    if (!queryPStates(index, available)) {
         QSignalBlocker blocker(ui.selectedGPU);
         ui.selectedGPU->setCurrentIndex(previous);
         return;
     }
 
+    const int limit = pickGlobalLimit(available, config["pstate_limit"].get<int>());
+
     bool ok;
 
     {
+        // One step: release the old GPU, switch, and move the global limit and
+        // every row onto states the new GPU offers. Done piecemeal, the poll
+        // thread could send the old GPU a P-State only the new one has -- and
+        // a driver that refuses it is a fatal error.
         StateGuard guard;
 
-        // Release the GPU we are leaving, or it stays clamped forever.
         if (state.applied[previous] != APPLIED_NEVER && state.applied[previous] != policy::PSTATE_UNLIMITED) {
             applyLocked(previous, policy::PSTATE_UNLIMITED);
         }
 
-        state.gpuIndex = index;
-        ok             = evaluateLocked();
+        state.gpuIndex    = index;
+        state.globalLimit = limit;
+
+        for (ProcessEntry& entry : state.entries) {
+            entry.background = policy::snapToAvailable(entry.background, available);
+        }
+
+        ok = evaluateLocked();
     }
 
     config["gpu_index"] = index;
     saveConfig();
+
+    // The combos and config.json catch up with what is already in effect.
+    showPStates(available, limit);
 
     if (!ok) {
         reportFatal("Error: Failed to set P-State");
@@ -1008,7 +1099,7 @@ void limitnvpstate::selectedPStateChanged(int index) {
     }
 
     bool      ok     = false;
-    const int pstate = ui.selectedPState->itemText(index).mid(1).toInt(&ok);   // strip the leading 'P'
+    const int pstate = ui.selectedPState->itemData(index).toInt(&ok);
 
     if (!ok) {
         return;
@@ -1032,7 +1123,9 @@ void limitnvpstate::selectedPStateChanged(int index) {
     }
 }
 
-bool limitnvpstate::getAvailablePStates(int gpuIndex) {
+bool limitnvpstate::queryPStates(int gpuIndex, std::vector<int>& available) {
+    available.clear();
+
     if (gpuIndex < 0 || static_cast<NvU32>(gpuIndex) >= gpuCount) {
         return false;
     }
@@ -1045,8 +1138,6 @@ bool limitnvpstate::getAvailablePStates(int gpuIndex) {
     if (NvAPI_GPU_GetPstates20(hPhysicalGpus[gpuIndex], &pStatesInfo) != 0) {
         return fail("Error: Failed to obtain available P-States");
     }
-
-    std::vector<int> available;
 
     // P0 is the unlimited state, not a valid limit. Skip it by id rather than
     // assuming it is entry 0, and never trust the driver's count past the
@@ -1067,6 +1158,10 @@ bool limitnvpstate::getAvailablePStates(int gpuIndex) {
         return fail("Error: The GPU reported no limitable P-States");
     }
 
+    return true;
+}
+
+void limitnvpstate::showPStates(const std::vector<int>& available, int selected) {
     availablePStates = available;
     refreshBackgroundCombos();
 
@@ -1075,37 +1170,16 @@ bool limitnvpstate::getAvailablePStates(int gpuIndex) {
 
     ui.selectedPState->clear();
 
-    const int currentLimit = config["pstate_limit"].get<int>();
-
-    int matchRow = -1;
-
     for (int pstate : available) {
-        ui.selectedPState->addItem(QStringLiteral("P%1").arg(pstate));
-
-        if (pstate == currentLimit) {
-            matchRow = ui.selectedPState->count() - 1;
-        }
+        ui.selectedPState->addItem(QStringLiteral("P%1").arg(pstate), pstate);
     }
 
-    if (matchRow < 0) {
-        matchRow = ui.selectedPState->count() - 1;   // deepest available state
-    }
+    ui.selectedPState->setCurrentIndex(ui.selectedPState->findData(selected));
 
-    ui.selectedPState->setCurrentIndex(matchRow);
-
-    const int selected = available[static_cast<size_t>(matchRow)];
-
-    {
-        StateGuard guard;
-        state.globalLimit = selected;
-    }
-
-    if (selected != currentLimit) {
+    if (config["pstate_limit"].get<int>() != selected) {
         config["pstate_limit"] = selected;
         saveConfig();
     }
-
-    return true;
 }
 
 void limitnvpstate::addProcess() {
@@ -1193,10 +1267,6 @@ void limitnvpstate::fillBackgroundCombo(QComboBox* combo, int background) const 
     combo->setCurrentIndex(row >= 0 ? row : 0);
 }
 
-int limitnvpstate::backgroundOf(QTreeWidgetItem* item) const {
-    return rowBackground(ui.processExceptionsList, item);
-}
-
 void limitnvpstate::refreshBackgroundCombos() {
     bool changed = false;
 
@@ -1208,7 +1278,7 @@ void limitnvpstate::refreshBackgroundCombos() {
             continue;
         }
 
-        const int current = backgroundOf(item);
+        const int current = rowBackground(ui.processExceptionsList, item);
         const int snapped = policy::snapToAvailable(current, availablePStates);
 
         fillBackgroundCombo(combo, snapped);
