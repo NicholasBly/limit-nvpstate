@@ -1,5 +1,8 @@
 #pragma once
 
+// nvapi.h relies on the SAL annotations (__success, __in, ...) that the
+// Windows headers bring in. It used to get them by accident through <atomic>.
+#include <Windows.h>
 #include <nvapi.h>
 
 // pstateType argument for NvAPI_GPU_SetPstateClientLimits. The original used a
