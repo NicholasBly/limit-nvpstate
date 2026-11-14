@@ -135,6 +135,7 @@
     <ClCompile Include="about.cpp" />
     <ClCompile Include="config.cpp" />
     <ClCompile Include="nvidia.cpp" />
+    <ClCompile Include="pstatepolicy.cpp" />
     <ClCompile Include="utils.cpp" />
     <QtRcc Include="limitnvpstate.qrc" />
     <QtUic Include="about.ui" />
@@ -148,6 +149,7 @@
     <ClInclude Include="config.h" />
     <ClInclude Include="log.h" />
     <ClInclude Include="nvidia.h" />
+    <ClInclude Include="pstatepolicy.h" />
     <ClInclude Include="resource.h" />
     <ClInclude Include="utils.h" />
   </ItemGroup>

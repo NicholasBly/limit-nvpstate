@@ -49,6 +49,9 @@
     <ClCompile Include="nvidia.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="pstatepolicy.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="about.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -64,6 +67,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="nvidia.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="pstatepolicy.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="log.h">
