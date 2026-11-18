@@ -618,6 +618,23 @@ void publishEntries(std::vector<ProcessEntry> updated) {
     state.entries.swap(updated);
 }
 
+// Saves config.json. If that fails (read-only folder, full disk, file locked),
+// says so once per session instead of letting every change look saved.
+void persist() {
+    static bool warned = false;
+
+    if (saveConfig() || warned) {
+        return;
+    }
+
+    warned = true;
+    QMessageBox::warning(nullptr,
+                         "limit-nvpstate",
+                         "Could not save settings to config.json.\n\n"
+                         "Your changes apply now but will be lost when the program closes. "
+                         "Check that the program folder is writable.");
+}
+
 // The configured limit if this GPU offers it, otherwise its deepest state.
 int pickGlobalLimit(const std::vector<int>& available, int wanted) {
     for (int pstate : available) {
@@ -639,8 +656,9 @@ int rowBackground(const QTreeWidget* list, QTreeWidgetItem* item) {
     return combo ? combo->currentData().toInt() : policy::BACKGROUND_DEFAULT;
 }
 
-// Reads every row and writes both config keys. Returns the rows as entries.
-std::vector<ProcessEntry> writeProcessConfig(const QTreeWidget* list) {
+// Reads every row into both config keys (in memory; the caller saves).
+// Returns the rows as entries.
+std::vector<ProcessEntry> updateProcessConfig(const QTreeWidget* list) {
     nlohmann::json            names     = nlohmann::json::array();
     nlohmann::json            overrides = nlohmann::json::object();
     std::vector<ProcessEntry> entries;
@@ -672,7 +690,6 @@ std::vector<ProcessEntry> writeProcessConfig(const QTreeWidget* list) {
 
     config["process_exceptions"]         = std::move(names);
     config["process_background_pstates"] = std::move(overrides);
-    saveConfig();
 
     return entries;
 }
@@ -768,7 +785,7 @@ bool limitnvpstate::init() {
 
     connect(ui.actionStartMinimized, &QAction::triggered, this, [this]() {
         config["start_minimized"] = ui.actionStartMinimized->isChecked();
-        saveConfig();
+        persist();
     });
 
     // ---- File -> Add To Startup ----
@@ -814,7 +831,7 @@ bool limitnvpstate::init() {
     if (gpuIndex < 0 || static_cast<NvU32>(gpuIndex) >= gpuCount) {
         gpuIndex = 0;
         config["gpu_index"] = 0;
-        saveConfig();
+        persist();
     }
 
     state.gpuIndex = gpuIndex;
@@ -857,7 +874,7 @@ bool limitnvpstate::init() {
     if (trigger < 0 || trigger >= UNLIMIT_TRIGGER_COUNT) {
         trigger = TRIGGER_PROCESS_RUNNING;
         config["unlimit_trigger"] = trigger;
-        saveConfig();
+        persist();
     }
 
     state.trigger = static_cast<policy::Trigger>(trigger);
@@ -925,10 +942,12 @@ bool limitnvpstate::init() {
                     continue;
                 }
 
-                const nlohmann::json& value = it.value();
-                const bool            isInt = value.is_number_integer();
+                // Range-checked before any conversion: no float or huge
+                // integer is ever narrowed into something that looks valid.
+                long long  stored = 0;
+                const bool isInt  = jsonIntInRange(it.value(), 0, policy::PSTATE_MAX, &stored);
 
-                background = policy::sanitizeBackground(isInt, isInt ? value.get<long long>() : 0);
+                background = policy::sanitizeBackground(isInt, stored);
 
                 // Default is never written, so a stored key that comes back as
                 // Default was garbage: drop it from the file.
@@ -947,7 +966,8 @@ bool limitnvpstate::init() {
 
         // A sanitised or snapped value: store what is actually in use.
         if (repaired) {
-            writeProcessConfig(ui.processExceptionsList);
+            updateProcessConfig(ui.processExceptionsList);
+            persist();
         }
     }
 
@@ -1013,7 +1033,6 @@ void limitnvpstate::unlimitTriggerChanged(int index) {
     }
 
     config["unlimit_trigger"] = index;
-    saveConfig();
 
     {
         StateGuard guard;
@@ -1028,6 +1047,8 @@ void limitnvpstate::unlimitTriggerChanged(int index) {
     // Detectors that stay on keep their state; only what the new trigger
     // does not need is stopped. Then one evaluation from that known state.
     updateDetectors();
+
+    persist();
 }
 
 void limitnvpstate::selectedGPUChanged(int index) {
@@ -1082,7 +1103,7 @@ void limitnvpstate::selectedGPUChanged(int index) {
     }
 
     config["gpu_index"] = index;
-    saveConfig();
+    persist();
 
     // The combos and config.json catch up with what is already in effect.
     showPStates(available, limit);
@@ -1106,7 +1127,6 @@ void limitnvpstate::selectedPStateChanged(int index) {
     }
 
     config["pstate_limit"] = pstate;
-    saveConfig();
 
     bool applied;
 
@@ -1121,6 +1141,8 @@ void limitnvpstate::selectedPStateChanged(int index) {
     if (!applied) {
         reportFatal("Error: Failed to set P-State");
     }
+
+    persist();
 }
 
 bool limitnvpstate::queryPStates(int gpuIndex, std::vector<int>& available) {
@@ -1178,7 +1200,7 @@ void limitnvpstate::showPStates(const std::vector<int>& available, int selected)
 
     if (config["pstate_limit"].get<int>() != selected) {
         config["pstate_limit"] = selected;
-        saveConfig();
+        persist();
     }
 }
 
@@ -1291,13 +1313,17 @@ void limitnvpstate::refreshBackgroundCombos() {
 }
 
 void limitnvpstate::saveProcessExceptions() {
-    publishEntries(writeProcessConfig(ui.processExceptionsList));
+    publishEntries(updateProcessConfig(ui.processExceptionsList));
 
     // Rescan with the new names now rather than at the next interval, start
     // or stop detectors if a row left or joined Default, and re-evaluate the
     // current foreground against the new list.
     wakePoll();
     updateDetectors();
+
+    // Apply first, save second: a failed save (and its warning) must not hold
+    // up the change itself.
+    persist();
 }
 
 void limitnvpstate::releaseLimits() {
