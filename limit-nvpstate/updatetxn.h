@@ -49,6 +49,11 @@ std::wstring errorText(const wchar_t* what, DWORD code);
 bool writeTextFile(const std::wstring& path, const std::wstring& text, DWORD disposition);
 bool readTextFile(const std::wstring& path, std::wstring& text);
 
+// Makes sure a file's data is on the disk, not only in the cache: a rename
+// can reach the disk before the data it points at, and a power cut in
+// between leaves a file of zeros.
+bool flushToDisk(const std::wstring& path);
+
 // Every file under root\relative and their total size. Strict: a link or any
 // listing error fails it -- a partial list must never be acted on.
 bool listPackage(const std::wstring&        root,

@@ -2,6 +2,7 @@
 
 #include <config.h>
 #include <updater.h>
+#include <testhooks.h>
 #include <updatetxn.h>
 #include <utils.h>
 #include <version.h>
@@ -79,6 +80,19 @@ LaunchOptions parseLaunchOptions() {
 }
 
 // ---- single instance ----
+// Brings the running copy's window up, if one is running.
+void showRunningCopy() {
+    const HANDLE showEvent = OpenEventW(EVENT_MODIFY_STATE, FALSE, SHOW_EVENT_NAME);
+
+    if (showEvent) {
+        // We are the foreground process (the user just launched us), so we
+        // may hand the foreground right to the running instance.
+        AllowSetForegroundWindow(ASFW_ANY);
+        SetEvent(showEvent);
+        CloseHandle(showEvent);
+    }
+}
+
 // The handle is intentionally left open for the process lifetime; Windows
 // releases it on exit. GetLastError() is read immediately, before anything
 // else can clobber it. False: another instance runs (and was asked to show).
@@ -87,16 +101,7 @@ bool becomeSingleInstance() {
     const DWORD  mutexError    = GetLastError();
 
     if (!instanceMutex || mutexError == ERROR_ALREADY_EXISTS) {
-        const HANDLE showEvent = OpenEventW(EVENT_MODIFY_STATE, FALSE, SHOW_EVENT_NAME);
-
-        if (showEvent) {
-            // We are the foreground process (the user just launched us), so we
-            // may hand the foreground right to the running instance.
-            AllowSetForegroundWindow(ASFW_ANY);
-            SetEvent(showEvent);
-            CloseHandle(showEvent);
-        }
-
+        showRunningCopy();
         return false;
     }
 
@@ -122,6 +127,7 @@ int main(int argc, char* argv[]) {
     // version it started): it starts the program itself when it is done. Only
     // the new version it starts gets past this.
     if (!afterUpdate && updatetxn::updateLockHeld()) {
+        showRunningCopy();   // the new version, if it is up yet
         return 0;
     }
 
@@ -217,5 +223,7 @@ int main(int argc, char* argv[]) {
         QTimer::singleShot(0, &w, [text]() { showPlainWarning(text); });
     }
 
-    return a.exec();
+    const int code = a.exec();
+    testPause(L"LIMITNV_TEST_PAUSE_AT_EXIT");   // test only: a copy slow to close
+    return code;
 }

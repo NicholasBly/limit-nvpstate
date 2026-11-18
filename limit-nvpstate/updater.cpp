@@ -719,7 +719,8 @@ bool prepare(const Release&      release,
     const std::wstring helperDir = helper.substr(0, helper.find_last_of(L'\\'));
 
     if (!CreateDirectoryW(helperDir.c_str(), nullptr)
-        || !CopyFileW((root + L"\\limit-nvpstate-updater.exe").c_str(), helper.c_str(), TRUE)) {
+        || !CopyFileW((root + L"\\limit-nvpstate-updater.exe").c_str(), helper.c_str(), TRUE)
+        || !updatetxn::flushToDisk(helper)) {
         error = errorText(L"Could not set up the updater", GetLastError());
         return false;
     }

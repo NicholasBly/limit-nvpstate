@@ -41,6 +41,8 @@ constexpr DWORD READY_MS     = 30000;   // the new version to say it is up
 constexpr DWORD GRACE_MS     = 3000;    // ...and still be running after that
 constexpr DWORD TERMINATE_MS = 10000;   // a stopped new version to be gone
 constexpr DWORD LOCK_MS      = 30000;
+constexpr int   COMMIT_TRIES    = 5;     // writing "committed"...
+constexpr DWORD COMMIT_RETRY_MS = 200;   // ...this far apart
 
 struct Options {
     enum class Mode { Install, Recover, Invalid } mode = Mode::Invalid;
@@ -184,7 +186,13 @@ void restartApp(const std::wstring& appDir, bool show) {
 
     if (process) {
         CloseHandle(process);
+        return;
     }
+
+    // Nothing else is running to tell the user, and the GPU is unmanaged.
+    const std::wstring text = updatetxn::errorText(L"limit-nvpstate could not be started again after the update", error) +
+                              L"\n\nStart limit-nvpstate.exe from its folder.";
+    MessageBoxW(nullptr, text.c_str(), L"limit-nvpstate updater", MB_ICONWARNING | MB_OK);
 }
 
 std::wstring exitCodeText(HANDLE process) {
@@ -223,12 +231,23 @@ int install(const std::wstring& appDir, HANDLE oldApp, bool show) {
     // Nothing is touched until the old version is really gone: its exe and
     // DLLs are in use until then.
     const DWORD closed = WaitForSingleObject(oldApp, testValue(L"LIMITNV_TEST_OLD_EXIT_MS", OLD_EXIT_MS));
-    CloseHandle(oldApp);
 
     if (closed != WAIT_OBJECT_0) {
+        // Nothing was changed. It is still closing (it said it would), so
+        // once it is gone it is started again -- otherwise nothing would be
+        // running. The lock is let go first: it would block a start by hand.
+        std::wstring phaseError;
+        updatetxn::writePhase(appDir, Phase::RolledBack, phaseError);
+        updatetxn::writeResult(appDir, L"The previous version took too long to close, so the update was not "
+                                       L"installed. Nothing was changed.");
         updatetxn::releaseUpdateLock(lock);
-        return 1;   // it is still running; nothing was changed
+        WaitForSingleObject(oldApp, INFINITE);
+        CloseHandle(oldApp);
+        restartApp(appDir, show);
+        return 1;
     }
+
+    CloseHandle(oldApp);
 
     std::wstring packageDir;
     std::wstring error;
@@ -286,14 +305,36 @@ int install(const std::wstring& appDir, HANDLE oldApp, bool show) {
                 // Said it is up. Still running a moment later?
                 if (WaitForSingleObject(child, testValue(L"LIMITNV_TEST_GRACE_MS", GRACE_MS)) == WAIT_TIMEOUT) {
                     std::wstring phaseError;
-                    updatetxn::writePhase(appDir, Phase::Committed, phaseError);
-                    CloseHandle(child);
-                    CloseHandle(ready);
-                    updatetxn::releaseUpdateLock(lock);
-                    return 0;
-                }
+                    bool         committed = false;
 
-                reason = L"The new version stopped right after starting (exit code " + exitCodeText(child) + L").";
+                    // A brief lock on phase.txt (a virus scanner) must not
+                    // undo a working update.
+                    for (int attempt = 0; attempt < COMMIT_TRIES && !committed; attempt++) {
+                        if (attempt > 0) {
+                            Sleep(COMMIT_RETRY_MS);
+                        }
+
+                        if (testFails(L"LIMITNV_TEST_FAIL_COMMIT", L"1")) {
+                            phaseError = L"injected failure";
+                        } else {
+                            committed = updatetxn::writePhase(appDir, Phase::Committed, phaseError);
+                        }
+                    }
+
+                    if (committed) {
+                        CloseHandle(child);
+                        CloseHandle(ready);
+                        updatetxn::releaseUpdateLock(lock);
+                        return 0;
+                    }
+
+                    // Left as "verifying", the next start would undo it
+                    // anyway -- maybe days later, with no reason given.
+                    reason = L"The new version started fine, but the update could not be recorded (" + phaseError +
+                             L"), so it was undone to keep things consistent.";
+                } else {
+                    reason = L"The new version stopped right after starting (exit code " + exitCodeText(child) + L").";
+                }
             } else if (waited == WAIT_OBJECT_0 + 1) {
                 reason = L"The new version stopped while starting (exit code " + exitCodeText(child) + L").";
             } else if (waited == WAIT_TIMEOUT) {

@@ -3,6 +3,7 @@
 #include <testhooks.h>
 
 #include <algorithm>
+#include <atomic>
 
 namespace updatetxn {
 
@@ -17,6 +18,8 @@ const wchar_t PHASE_TMP[]     = L"phase.tmp";
 const wchar_t RESULT_FILE[]   = L"result.txt";
 const wchar_t UPDATE_LOCK[]   = L"Local\\limit-nvpstate-update";
 const wchar_t HELPER_NAME[]   = L"limit-nvpstate-updater.exe";
+const int     RETIRE_TRIES    = 20;    // renaming the work folder...
+const DWORD   RETIRE_RETRY_MS = 250;   // ...this far apart: about 5 s
 
 bool sameName(const std::wstring& a, const wchar_t* b) {
     return CompareStringOrdinal(a.c_str(), -1, b, -1, TRUE) == CSTR_EQUAL;
@@ -283,6 +286,29 @@ bool writeTextFile(const std::wstring& path, const std::wstring& text, DWORD dis
     return ok;
 }
 
+bool flushToDisk(const std::wstring& path) {
+    // Others may have it open (a virus scanner): share everything, and give
+    // one that opened it without sharing a moment to let go.
+    for (int attempt = 0;; attempt++) {
+        HANDLE file = CreateFileW(path.c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                  nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+
+        if (file != INVALID_HANDLE_VALUE) {
+            const bool  ok    = FlushFileBuffers(file) != FALSE;
+            const DWORD error = GetLastError();
+            CloseHandle(file);
+            SetLastError(error);
+            return ok;
+        }
+
+        if (GetLastError() != ERROR_SHARING_VIOLATION || attempt == 9) {
+            return false;
+        }
+
+        Sleep(100);
+    }
+}
+
 bool readTextFile(const std::wstring& path, std::wstring& text) {
     HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
                               FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -465,8 +491,11 @@ bool openWorkDir(const std::wstring& appDir, std::wstring& error) {
             return false;
         }
 
-        if (!removeTree(dir)) {
-            error = L"Could not clear the updater's folder (" + dir + L")";
+        // Set aside in one step, never deleted in place: a delete that
+        // stopped halfway could take owner.txt and leave a folder that blocks
+        // every later update. The tombstone is deleted after a later update.
+        if (!retire(appDir)) {
+            error = errorText((L"Could not clear the updater's folder (" + dir + L")").c_str(), GetLastError());
             return false;
         }
     }
@@ -717,6 +746,24 @@ SwapResult swapIn(const std::wstring& packageDir, const std::wstring& appDir, st
         }
     }
 
+    // ---- the new files' data reaches the disk before any rename points at it
+    for (const JournalEntry& step : plan) {
+        if (step.kind != L'A' && step.kind != L'R') {
+            continue;
+        }
+
+        if (testFails(L"LIMITNV_TEST_FAIL_FLUSH", step.path)) {
+            SetLastError(ERROR_WRITE_FAULT);
+            error = errorText((L"Could not write " + step.path + L" to disk").c_str(), GetLastError());
+            return SwapResult::RolledBack;
+        }
+
+        if (!flushToDisk(packageDir + L"\\" + step.path)) {
+            error = errorText((L"Could not write " + step.path + L" to disk").c_str(), GetLastError());
+            return SwapResult::RolledBack;
+        }
+    }
+
     // ---- the plan and the phase reach the disk before any program file
     if (!writeTextFile(workFile(appDir, JOURNAL_FILE), updaterules::formatJournal(plan), CREATE_NEW)) {
         error = errorText(L"Could not write the update journal", GetLastError());
@@ -779,8 +826,9 @@ SwapResult swapIn(const std::wstring& packageDir, const std::wstring& appDir, st
                 return fail(L"Could not create the backup folder for " + step.path);
             }
 
+            // A copy is new data: on the disk before the old file is replaced.
             if (!CreateHardLinkW(backup.c_str(), target.c_str(), nullptr)
-                && !CopyFileW(target.c_str(), backup.c_str(), TRUE)) {
+                && (!CopyFileW(target.c_str(), backup.c_str(), TRUE) || !flushToDisk(backup))) {
                 return fail(L"Could not back up " + step.path);
             }
 
@@ -884,11 +932,39 @@ bool retire(const std::wstring& appDir) {
     // One rename ends the transaction: from here on nothing reads it, so a
     // crash during the deletion below can't be mistaken for an unfinished
     // update, and a new update gets a fresh folder of its own.
-    const std::wstring tombstone = appDir + L"\\" + TOMBSTONE + std::to_wstring(GetTickCount64()) + L"-"
-                                 + std::to_wstring(GetCurrentProcessId());
-
     testPause(L"LIMITNV_TEST_PAUSE_RETIRE");
-    return MoveFileExW(workDir(appDir).c_str(), tombstone.c_str(), 0) != FALSE;
+
+    // Test only: the first N renames fail, as one does on Windows while a
+    // file inside (the helper, still closing) is open.
+    static std::atomic<unsigned> injected{ 0 };
+
+    // Retried: right after an update the helper exe inside may still be
+    // closing, and a virus scanner may be reading a new file.
+    for (int attempt = 1;; attempt++) {
+        const std::wstring tombstone = appDir + L"\\" + TOMBSTONE + std::to_wstring(GetTickCount64()) + L"-"
+                                     + std::to_wstring(GetCurrentProcessId());
+        bool renamed = false;
+
+        if (injected < testValue(L"LIMITNV_TEST_FAIL_RETIRE_TIMES", 0)) {
+            injected++;
+            SetLastError(ERROR_SHARING_VIOLATION);
+        } else {
+            renamed = MoveFileExW(workDir(appDir).c_str(), tombstone.c_str(), 0) != FALSE;
+        }
+
+        if (renamed) {
+            return true;
+        }
+
+        const DWORD error = GetLastError();
+
+        if (attempt >= RETIRE_TRIES || probe(workDir(appDir)) == PathState::Missing) {
+            SetLastError(error);
+            return false;
+        }
+
+        Sleep(RETIRE_RETRY_MS);
+    }
 }
 
 void deleteTombstones(const std::wstring& appDir) {
