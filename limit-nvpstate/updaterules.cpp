@@ -266,7 +266,8 @@ std::wstring lowerAscii(std::wstring s) {
 bool isDeviceName(const std::wstring& part) {
     const std::wstring base = lowerAscii(part.substr(0, part.find(L'.')));
 
-    if (base == L"con" || base == L"prn" || base == L"aux" || base == L"nul") {
+    if (base == L"con" || base == L"prn" || base == L"aux" || base == L"nul" || base == L"conin$"
+        || base == L"conout$") {
         return true;
     }
 
@@ -281,8 +282,11 @@ bool isSafeRelativePath(const std::wstring& path) {
         return false;
     }
 
+    // Printable ASCII only: release file names are, and it rules out every
+    // Unicode look-alike and case-folding question at once.
     for (wchar_t c : path) {
-        if (c < 0x20 || c == L':' || c == L'*' || c == L'?' || c == L'"' || c == L'<' || c == L'>' || c == L'|') {
+        if (c < 0x20 || c > 0x7E || c == L':' || c == L'*' || c == L'?' || c == L'"' || c == L'<' || c == L'>'
+            || c == L'|') {
             return false;
         }
     }
@@ -311,7 +315,7 @@ bool isSafeRelativePath(const std::wstring& path) {
 
 namespace {
 
-const wchar_t JOURNAL_HEADER[] = L"limit-nvpstate update journal 1";
+const wchar_t JOURNAL_HEADER[] = L"limit-nvpstate update journal 2";
 
 } // namespace
 
@@ -365,7 +369,51 @@ bool parseJournal(const std::wstring& text, std::vector<JournalEntry>& out) {
         i = end + 1;
     }
 
+    // Exactly one package line, first, inside download\unpacked.
+    if (out.empty() || out[0].kind != L'P') {
+        return false;
+    }
+
+    const std::wstring package = lowerAscii(out[0].path);
+    const std::wstring root    = L"download\\unpacked";
+
+    if (package != root && package.compare(0, root.size() + 1, root + L"\\") != 0) {
+        return false;
+    }
+
+    std::vector<std::wstring> seen;
+
+    for (size_t k = 1; k < out.size(); k++) {
+        const std::wstring key = lowerAscii(out[k].path);
+
+        if (out[k].kind == L'P' || isReservedPath(out[k].path) || (out[k].kind == L'R' && key == L"config.json")) {
+            return false;
+        }
+
+        for (const std::wstring& other : seen) {
+            if (other == key) {
+                return false;
+            }
+        }
+
+        seen.push_back(key);
+    }
+
     return true;
+}
+
+bool isReservedPath(const std::wstring& path) {
+    const std::wstring lower = lowerAscii(path);
+    const size_t       slash = lower.find_first_of(L"\\/");
+    const std::wstring first = lower.substr(0, slash);
+
+    // The updater's folder, and its tombstones "limit-nvpstate-update.done-..."
+    // (not limit-nvpstate-updater.exe, which merely starts the same way).
+    if (first == L"limit-nvpstate-update" || first.compare(0, 22, L"limit-nvpstate-update.") == 0) {
+        return true;
+    }
+
+    return slash == std::wstring::npos && first.compare(0, 15, L"config.json.bak") == 0;
 }
 
 std::wstring packageProblem(const std::vector<std::wstring>& files, unsigned long long totalBytes) {
@@ -388,6 +436,10 @@ std::wstring packageProblem(const std::vector<std::wstring>& files, unsigned lon
             return L"The update package contains an unsafe path: " + file;
         }
 
+        if (isReservedPath(file)) {
+            return L"The update package contains a path reserved for the updater: " + file;
+        }
+
         std::wstring key = lowerAscii(file);
 
         for (wchar_t& c : key) {
@@ -403,8 +455,8 @@ std::wstring packageProblem(const std::vector<std::wstring>& files, unsigned lon
         seen.push_back(key);
     }
 
-    for (const wchar_t* required : { L"limit-nvpstate.exe", L"qt5core.dll", L"qt5gui.dll", L"qt5widgets.dll",
-                                     L"platforms\\qwindows.dll" }) {
+    for (const wchar_t* required : { L"limit-nvpstate.exe", L"limit-nvpstate-updater.exe", L"qt5core.dll",
+                                     L"qt5gui.dll", L"qt5widgets.dll", L"platforms\\qwindows.dll" }) {
         bool found = false;
 
         for (const std::wstring& key : seen) {
@@ -417,6 +469,228 @@ std::wstring packageProblem(const std::vector<std::wstring>& files, unsigned lon
     }
 
     return {};
+}
+
+namespace {
+
+unsigned read16(const std::string& s, size_t at) {
+    return static_cast<unsigned>(static_cast<unsigned char>(s[at]))
+         | static_cast<unsigned>(static_cast<unsigned char>(s[at + 1])) << 8;
+}
+
+unsigned long read32(const std::string& s, size_t at) {
+    return static_cast<unsigned long>(read16(s, at)) | static_cast<unsigned long>(read16(s, at + 2)) << 16;
+}
+
+} // namespace
+
+bool findZipDirectory(const std::string& tail, unsigned long long fileSize, unsigned long long& offset,
+                      unsigned long long& size, unsigned& count) {
+    constexpr size_t END_RECORD = 22;
+
+    if (tail.size() < END_RECORD || tail.size() > fileSize) {
+        return false;
+    }
+
+    // Backwards: the end record is last, followed only by its own comment.
+    for (size_t at = tail.size() - END_RECORD + 1; at-- > 0;) {
+        if (tail.compare(at, 4, "PK\x05\x06") != 0 || read16(tail, at + 20) != tail.size() - at - END_RECORD) {
+            continue;
+        }
+
+        const unsigned      disk         = read16(tail, at + 4);
+        const unsigned      directoryOn  = read16(tail, at + 6);
+        const unsigned      entriesHere  = read16(tail, at + 8);
+        const unsigned      entriesTotal = read16(tail, at + 10);
+        const unsigned long bytes        = read32(tail, at + 12);
+        const unsigned long start        = read32(tail, at + 16);
+
+        if (disk != 0 || directoryOn != 0 || entriesHere != entriesTotal || entriesTotal == 0xFFFF
+            || bytes == 0xFFFFFFFFul || start == 0xFFFFFFFFul) {
+            return false;   // multi-disk or zip64
+        }
+
+        const unsigned long long endRecordAt = fileSize - tail.size() + at;
+
+        if (static_cast<unsigned long long>(start) + bytes > endRecordAt) {
+            return false;
+        }
+
+        offset = start;
+        size   = bytes;
+        count  = entriesTotal;
+        return true;
+    }
+
+    return false;
+}
+
+bool parseZipDirectory(const std::string& directory, unsigned count, std::vector<ZipEntry>& out) {
+    constexpr size_t HEADER = 46;
+
+    out.clear();
+    size_t at = 0;
+
+    for (unsigned i = 0; i < count; i++) {
+        if (directory.size() - at < HEADER || directory.compare(at, 4, "PK\x01\x02") != 0) {
+            return false;
+        }
+
+        const unsigned      madeBy     = read16(directory, at + 4);
+        const unsigned      flags      = read16(directory, at + 8);
+        const unsigned      method     = read16(directory, at + 10);
+        const unsigned long packed     = read32(directory, at + 20);
+        const unsigned long unpacked   = read32(directory, at + 24);
+        const size_t        nameLength = read16(directory, at + 28);
+        const size_t        extra      = read16(directory, at + 30);
+        const size_t        comment    = read16(directory, at + 32);
+        const unsigned long external   = read32(directory, at + 38);
+
+        if (packed == 0xFFFFFFFFul || unpacked == 0xFFFFFFFFul
+            || directory.size() - at - HEADER < nameLength + extra + comment) {
+            return false;
+        }
+
+        ZipEntry entry;
+        entry.name = directory.substr(at + HEADER, nameLength);
+        entry.size = unpacked;
+
+        const bool unix = (madeBy >> 8) == 3;
+        const char last = entry.name.empty() ? '\0' : entry.name.back();
+
+        entry.directory = last == '/' || last == '\\' || (!unix && (external & 0x10));
+        entry.link      = (unix && ((external >> 16) & 0170000) == 0120000) || (!unix && (external & 0x400));
+        entry.unsupported = (flags & 0x41) != 0 || (method != 0 && method != 8);
+
+        out.push_back(entry);
+        at += HEADER + nameLength + extra + comment;
+    }
+
+    return true;
+}
+
+std::wstring zipProblem(const std::vector<ZipEntry>& entries, std::wstring& topFolder) {
+    if (entries.empty()) {
+        return L"The update package is empty";
+    }
+
+    if (entries.size() > 2000) {
+        return L"The update package has too many files";
+    }
+
+    std::wstring              top;
+    std::vector<std::wstring> files;
+    unsigned long long        bytes = 0;
+
+    for (const ZipEntry& entry : entries) {
+        std::wstring name;
+
+        for (char c : entry.name) {
+            const unsigned char u = static_cast<unsigned char>(c);
+
+            if (u < 0x20 || u > 0x7E) {
+                return L"The update package contains a file with an unexpected name";
+            }
+
+            name += (c == '/') ? L'\\' : static_cast<wchar_t>(u);
+        }
+
+        while (!name.empty() && name.back() == L'\\') {
+            name.pop_back();
+        }
+
+        if (entry.unsupported) {
+            return L"The update package uses a zip feature this updater does not support: " + name;
+        }
+
+        if (entry.link) {
+            return L"The update package contains a link, so it was not unpacked: " + name;
+        }
+
+        if (name.empty() || !isSafeRelativePath(name)) {
+            return L"The update package contains an unsafe path: " + name;
+        }
+
+        const size_t       slash = name.find(L'\\');
+        const std::wstring first = name.substr(0, slash);
+
+        if (top.empty()) {
+            top = first;
+        } else if (lowerAscii(first) != lowerAscii(top)) {
+            return L"The update package has more than one top folder";
+        }
+
+        if (slash == std::wstring::npos) {
+            if (!entry.directory) {
+                return L"The update package has a file outside its folder: " + name;
+            }
+
+            continue;   // the top folder itself
+        }
+
+        const std::wstring relative = name.substr(slash + 1);
+
+        if (entry.directory) {
+            if (isReservedPath(relative)) {
+                return L"The update package contains a path reserved for the updater: " + relative;
+            }
+
+            continue;
+        }
+
+        files.push_back(relative);
+        bytes += entry.size;
+    }
+
+    const std::wstring problem = packageProblem(files, bytes);
+
+    if (problem.empty()) {
+        topFolder = top;
+    }
+
+    return problem;
+}
+
+namespace {
+
+struct PhaseName {
+    Phase          phase;
+    const wchar_t* name;
+};
+
+const PhaseName PHASES[] = {
+    { Phase::Swapping, L"swapping" },       { Phase::Verifying, L"verifying" },
+    { Phase::Committed, L"committed" },     { Phase::RollingBack, L"rolling-back" },
+    { Phase::RolledBack, L"rolled-back" },  { Phase::NeedsRepair, L"needs-repair" },
+};
+
+} // namespace
+
+bool parsePhase(const std::wstring& text, Phase& out) {
+    std::wstring word = text;
+
+    while (!word.empty() && (word.back() == L'\n' || word.back() == L'\r' || word.back() == L' ')) {
+        word.pop_back();
+    }
+
+    for (const PhaseName& p : PHASES) {
+        if (word == p.name) {
+            out = p.phase;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+const wchar_t* phaseName(Phase phase) {
+    for (const PhaseName& p : PHASES) {
+        if (p.phase == phase) {
+            return p.name;
+        }
+    }
+
+    return L"";
 }
 
 } // namespace updaterules

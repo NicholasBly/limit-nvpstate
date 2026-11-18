@@ -62,14 +62,52 @@ struct JournalEntry {
 
 std::wstring formatJournal(const std::vector<JournalEntry>& entries);
 
-// False if the text is not a complete journal (wrong header, unknown kind,
-// unsafe path, or cut off mid-line).
+// False if the text is not a complete, consistent journal: wrong header
+// (an older format included), unknown kind, unsafe or reserved path, cut off
+// mid-line, not exactly one P (first, under download\\unpacked), a path
+// twice, or config.json as a replaced file.
 bool parseJournal(const std::wstring& text, std::vector<JournalEntry>& out);
 
 // Why an unpacked package must not be installed, or empty if it may: the
-// files every release has (the exe, Qt5Core/Gui/Widgets, the Windows
-// platform plugin) must be there, every path must be safe, no name twice,
-// and size and file count must be sane.
+// files every release has (the exe, the updater helper, Qt5Core/Gui/Widgets,
+// the Windows platform plugin) must be there, every path must be safe and
+// not reserved, no name twice, and size and file count must be sane.
 std::wstring packageProblem(const std::vector<std::wstring>& files, unsigned long long totalBytes);
+
+// Paths a package may never write: the updater's own folder (and its
+// tombstones) and config backups next to config.json.
+bool isReservedPath(const std::wstring& path);
+
+// ---- the zip's own file list, read before anything is unpacked ----
+
+struct ZipEntry {
+    std::string        name;              // as stored ('/' or '\\' separators)
+    unsigned long long size        = 0;   // unpacked size
+    bool               directory   = false;
+    bool               link        = false;   // a symbolic link or reparse point
+    bool               unsupported = false;   // encrypted, or not stored/deflated
+};
+
+// `tail` is the last (up to 65,557) bytes of a file of `fileSize` bytes.
+// Finds the end record and returns where the central directory is. False if
+// there is none, or the zip spans disks or uses zip64.
+bool findZipDirectory(const std::string& tail, unsigned long long fileSize, unsigned long long& offset,
+                      unsigned long long& size, unsigned& count);
+
+// Reads `count` entries from the central directory bytes. False if they are
+// not all there or one uses zip64.
+bool parseZipDirectory(const std::string& directory, unsigned count, std::vector<ZipEntry>& out);
+
+// Why this zip must not be unpacked, or empty if it may: every entry under
+// one top folder (returned in `topFolder`), no files beside it, no links, no
+// unsupported entries, and the files under it pass packageProblem().
+std::wstring zipProblem(const std::vector<ZipEntry>& entries, std::wstring& topFolder);
+
+// ---- the transaction's phase, one word in phase.txt ----
+
+enum class Phase { Swapping, Verifying, Committed, RollingBack, RolledBack, NeedsRepair };
+
+bool           parsePhase(const std::wstring& text, Phase& out);
+const wchar_t* phaseName(Phase phase);
 
 } // namespace updaterules
