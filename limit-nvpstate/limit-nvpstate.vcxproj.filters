@@ -84,6 +84,9 @@
     <ClInclude Include="updaterules.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="testhooks.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="version.h">
       <Filter>Header Files</Filter>
     </ClInclude>

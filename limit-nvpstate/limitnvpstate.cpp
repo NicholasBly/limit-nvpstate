@@ -1,4 +1,5 @@
 #include <limitnvpstate.h>
+#include <testhooks.h>
 
 #include <about.h>
 #include <config.h>
@@ -221,14 +222,18 @@ std::vector<int> releaseAllLocked() {
 }
 
 // "GPU 0, P8, NVAPI status -1" for the most recent refusal.
-QString lastFailureText() {
-    StateGuard guard;
-
+// Caller holds stateLock.
+QString failureTextLocked() {
     return QStringLiteral("GPU %1, %2, NVAPI status %3")
         .arg(state.lastFailure.gpu)
         .arg(state.lastFailure.target == policy::PSTATE_UNLIMITED ? QStringLiteral("release")
                                                                    : QStringLiteral("P%1").arg(state.lastFailure.target))
         .arg(state.lastFailure.status);
+}
+
+QString lastFailureText() {
+    StateGuard guard;
+    return failureTextLocked();
 }
 
 // ---------------------------------------------------------------------------
@@ -1251,18 +1256,40 @@ void limitnvpstate::selectedGPUChanged(int index) {
 
     const int limit = pickGlobalLimit(available, config["pstate_limit"].get<int>());
 
-    bool ok       = true;
-    bool released = true;
+    bool    ok       = true;
+    bool    released = true;
+    QString failure;
 
     {
-        // One step: release the old GPU, switch, and move the global limit and
-        // every row onto states the new GPU offers. Done piecemeal, the poll
-        // thread could send the old GPU a P-State only the new one has -- and
-        // a driver that refuses it is a fatal error.
+        // One step under one lock: release the old GPU, switch, and move the
+        // global limit and every row onto states the new GPU offers. If the
+        // lock were dropped between the release and the switch, the poll
+        // thread could re-cap the old GPU in the gap, and the switch would
+        // then abandon it capped. (Done piecemeal the other way round, it
+        // could send the old GPU a P-State only the new one has.)
         StateGuard guard;
+
+        if (state.shuttingDown) {
+            return;
+        }
 
         if (state.applied[previous] != APPLIED_NEVER && state.applied[previous] != policy::PSTATE_UNLIMITED) {
             released = applyLocked(previous, policy::PSTATE_UNLIMITED);
+        }
+
+        testPause(L"LIMITNV_TEST_PAUSE_GPU_SWITCH");
+
+        if (released) {
+            state.gpuIndex    = index;
+            state.globalLimit = limit;
+
+            for (ProcessEntry& entry : state.entries) {
+                entry.background = policy::snapToAvailable(entry.background, available);
+            }
+
+            ok = evaluateLocked();
+        } else {
+            failure = failureTextLocked();   // before anyone else can overwrite it
         }
     }
 
@@ -1277,21 +1304,8 @@ void limitnvpstate::selectedGPUChanged(int index) {
         QMessageBox::critical(nullptr,
                               "limit-nvpstate",
                               QStringLiteral("Could not release the limit on the current GPU (%1), so it stays "
-                                             "selected.").arg(lastFailureText()));
+                                             "selected.").arg(failure));
         return;
-    }
-
-    {
-        StateGuard guard;
-
-        state.gpuIndex    = index;
-        state.globalLimit = limit;
-
-        for (ProcessEntry& entry : state.entries) {
-            entry.background = policy::snapToAvailable(entry.background, available);
-        }
-
-        ok = evaluateLocked();
     }
 
     config["gpu_index"] = index;

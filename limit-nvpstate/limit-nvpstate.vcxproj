@@ -157,6 +157,7 @@
     <ClInclude Include="resource.h" />
     <ClInclude Include="updater.h" />
     <ClInclude Include="updaterules.h" />
+    <ClInclude Include="testhooks.h" />
     <ClInclude Include="utils.h" />
     <ClInclude Include="version.h" />
   </ItemGroup>
