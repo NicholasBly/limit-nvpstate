@@ -50,6 +50,21 @@ jobs:
       - name: Install dependencies (vcpkg.json)
         run: .\vcpkg\vcpkg.exe install
 
+      - name: Set up the MSVC command line
+        uses: ilammy/msvc-dev-cmd@v1
+
+      # Pure decision rules; no Windows, Qt or GPU needed. A failure stops the
+      # job before anything is built or published.
+      - name: Unit tests
+        run: |
+          $src = $PWD.Path
+          Push-Location $env:RUNNER_TEMP
+          cl /nologo /std:c++17 /EHsc /W4 /utf-8 "/I$src\limit-nvpstate" "$src\tests\pstatepolicy_test.cpp" "$src\limit-nvpstate\pstatepolicy.cpp" /Fe:policy_test.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .\policy_test.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Pop-Location
+
       - name: Build
         run: .\build.ps1
 
