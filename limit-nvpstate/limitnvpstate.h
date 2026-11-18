@@ -34,13 +34,17 @@ public:
     // then leave the event loop.
     void shutdown(int exitCode);
 
-    // Tray balloon after an in-app update restarted the program.
-    void showUpdatedNotice();
+    // Once the updater helper has finished (it holds a lock until then), in
+    // the background: show how an update ended -- "Updated to X", or why it
+    // was rolled back -- and retire the updater's work folder. Also deletes
+    // tombstones a crash left behind.
+    void finishUpdateLater();
 
-    // Another instance took over the GPU while this one was starting (only
-    // possible right after an update): stop watching and forget what was
-    // applied, so exiting does not release the limit the other one now owns.
-    void yieldGpu();
+    // Started by the helper (--after-update): from inside the running event
+    // loop, half a second after init(), tell it we are up -- unless a fatal
+    // error is pending, so a version that is about to quit never counts as
+    // installed. Closes the handle.
+    void signalReadyLater(HANDLE event);
 
 private:
     Ui::limitnvpstateClass ui;
@@ -55,17 +59,14 @@ private:
     // Help -> Check for Updates: ask GitHub in the background, then offer.
     void checkForUpdates();
 
-    // Download and verify in the background, swap files, restart.
+    // Download and verify in the background, then hand over to the helper:
+    // release the GPU, start it, exit.
     void startUpdate(const updater::Release& release);
 
-    // Release the GPU, start the freshly installed exe and wait (without
-    // blocking) for it to say it is up; then quit. If it never does, undo the
-    // update and carry on.
-    void restartIntoUpdate(const QString& version);
+    // The hand-over did not happen: resume watching (unless exiting), delete
+    // the download, say why.
+    void resumeAfterFailedHandOff(const QString& reason);
 
-    // The installed update is not going ahead: put the old files back, resume
-    // (unless the program is exiting anyway) and say why.
-    void abandonUpdate(const QString& reason);
     bool fail(const char* message);
     void createTrayIcon();
     void saveProcessExceptions();

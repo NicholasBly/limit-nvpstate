@@ -117,8 +117,12 @@ bool removeTombstone(const std::wstring& dir) {
                     continue;
                 }
 
-                if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-                    removeTree(child);
+                // One pass each: this loop is the retry (nested retries would
+                // multiply the wait).
+                if (data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
+                    RemoveDirectoryW(child.c_str());
+                } else if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+                    removeTreeOnce(child);
                 } else {
                     SetFileAttributesW(child.c_str(), FILE_ATTRIBUTE_NORMAL);
                     DeleteFileW(child.c_str());
@@ -152,6 +156,67 @@ bool removeTombstone(const std::wstring& dir) {
     }
 
     return false;
+}
+
+// True if both names are the same file (a hard link), or two files with the
+// same bytes. Opening for attributes only works even on a file another
+// program holds open.
+bool sameFile(const std::wstring& a, const std::wstring& b) {
+    const auto identity = [](const std::wstring& path, BY_HANDLE_FILE_INFORMATION& info) {
+        HANDLE file = CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                  nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+
+        if (file == INVALID_HANDLE_VALUE) {
+            return false;
+        }
+
+        const bool ok = GetFileInformationByHandle(file, &info) != FALSE;
+        CloseHandle(file);
+        return ok;
+    };
+
+    BY_HANDLE_FILE_INFORMATION x = {};
+    BY_HANDLE_FILE_INFORMATION y = {};
+
+    if (!identity(a, x) || !identity(b, y)) {
+        return false;
+    }
+
+    if (x.dwVolumeSerialNumber == y.dwVolumeSerialNumber && x.nFileIndexHigh == y.nFileIndexHigh
+        && x.nFileIndexLow == y.nFileIndexLow) {
+        return true;
+    }
+
+    if (x.nFileSizeHigh != y.nFileSizeHigh || x.nFileSizeLow != y.nFileSizeLow) {
+        return false;
+    }
+
+    HANDLE fa = CreateFileW(a.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                            OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    HANDLE fb = CreateFileW(b.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                            OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    bool same = fa != INVALID_HANDLE_VALUE && fb != INVALID_HANDLE_VALUE;
+
+    std::vector<char> ba(64 * 1024);
+    std::vector<char> bb(64 * 1024);
+
+    while (same) {
+        DWORD ra = 0;
+        DWORD rb = 0;
+
+        if (!ReadFile(fa, ba.data(), static_cast<DWORD>(ba.size()), &ra, nullptr)
+            || !ReadFile(fb, bb.data(), static_cast<DWORD>(bb.size()), &rb, nullptr) || ra != rb) {
+            same = false;
+        } else if (ra == 0) {
+            break;
+        } else {
+            same = std::equal(ba.begin(), ba.begin() + ra, bb.begin());
+        }
+    }
+
+    if (fa != INVALID_HANDLE_VALUE) CloseHandle(fa);
+    if (fb != INVALID_HANDLE_VALUE) CloseHandle(fb);
+    return same;
 }
 
 bool isUnder(const std::wstring& path, const std::wstring& folder) {
@@ -424,8 +489,8 @@ bool openWorkDir(const std::wstring& appDir, std::wstring& error) {
 }
 
 void discardDownload(const std::wstring& appDir) {
-    if (ownsWorkDir(appDir) && !hasJournal(appDir)) {
-        retire(appDir);
+    if (ownsWorkDir(appDir) && !hasJournal(appDir) && retire(appDir)) {
+        deleteTombstones(appDir);
     }
 }
 
@@ -778,6 +843,13 @@ bool undo(const std::wstring& appDir, std::wstring& error) {
                 continue;
             }
 
+            // Backed up but never replaced (the swap stopped between the two):
+            // the target is still the previous file -- the very same one, for
+            // a hard-link backup. Nothing to put back.
+            if (probe(target) == PathState::File && sameFile(backup, target)) {
+                continue;
+            }
+
             // One rename puts the old file back. If the new one is in use
             // (a copy of the helper run by hand), move it aside first.
             if (!MoveFileExW(backup.c_str(), target.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
@@ -815,13 +887,8 @@ bool retire(const std::wstring& appDir) {
     const std::wstring tombstone = appDir + L"\\" + TOMBSTONE + std::to_wstring(GetTickCount64()) + L"-"
                                  + std::to_wstring(GetCurrentProcessId());
 
-    if (!MoveFileExW(workDir(appDir).c_str(), tombstone.c_str(), 0)) {
-        return false;
-    }
-
     testPause(L"LIMITNV_TEST_PAUSE_RETIRE");
-    removeTombstone(tombstone);
-    return true;
+    return MoveFileExW(workDir(appDir).c_str(), tombstone.c_str(), 0) != FALSE;
 }
 
 void deleteTombstones(const std::wstring& appDir) {

@@ -1,14 +1,13 @@
 #include <limitnvpstate.h>
-#include <testhooks.h>
 
 #include <config.h>
 #include <updater.h>
+#include <updatetxn.h>
 #include <utils.h>
 #include <version.h>
 
 #include <QApplication>
 #include <QMessageBox>
-#include <QThread>
 #include <QTimer>
 #include <QIcon>
 #include <QWinEventNotifier>
@@ -28,13 +27,13 @@ namespace {
 // Qt's back so Qt still thinks it is hidden.
 constexpr wchar_t SHOW_EVENT_NAME[] = L"Local\\limit-nvpstate-show";
 
-// Set by an update: "--after-update <old process handle> <ready event handle>
-// [--show]". Both are handles the old instance let us inherit; anything that
-// doesn't check out as such is ignored (a normal start).
+// Set by the updater helper when it starts a new version:
+// "--after-update <ready event handle> [--show]". The handle is one the helper
+// let us inherit; anything that doesn't check out is ignored (a normal start).
 struct LaunchOptions {
-    HANDLE oldInstance = nullptr;
-    HANDLE ready       = nullptr;
-    bool   show        = false;
+    HANDLE ready     = nullptr;
+    bool   show      = false;
+    bool   recovered = false;   // started by the helper right after it tried
 };
 
 HANDLE inheritedHandle(const wchar_t* text) {
@@ -60,21 +59,20 @@ LaunchOptions parseLaunchOptions() {
     }
 
     for (int i = 1; i < count; i++) {
-        if (wcscmp(args[i], L"--after-update") == 0 && i + 2 < count) {
-            options.oldInstance = inheritedHandle(args[++i]);
-            options.ready       = inheritedHandle(args[++i]);
+        if (wcscmp(args[i], L"--after-update") == 0 && i + 1 < count) {
+            options.ready = inheritedHandle(args[++i]);
         } else if (wcscmp(args[i], L"--show") == 0) {
             options.show = true;
+        } else if (wcscmp(args[i], L"--recovered") == 0) {
+            options.recovered = true;
         }
     }
 
     LocalFree(args);
 
-    // The old instance must be a process and the event a waitable object.
-    if (!options.oldInstance || !options.ready || GetProcessId(options.oldInstance) == 0
-        || WaitForSingleObject(options.ready, 0) == WAIT_FAILED) {
-        options.oldInstance = nullptr;
-        options.ready       = nullptr;
+    // Must be a waitable object (the helper's event).
+    if (options.ready && WaitForSingleObject(options.ready, 0) == WAIT_FAILED) {
+        options.ready = nullptr;
     }
 
     return options;
@@ -105,13 +103,6 @@ bool becomeSingleInstance() {
     return true;
 }
 
-// Off the GUI thread: deleting the backups may wait out a lock for a moment.
-void finishUpdateInBackground(const std::wstring& appDir) {
-    QThread* thread = QThread::create([appDir]() { updater::finishUpdate(appDir); });
-    QObject::connect(thread, &QThread::finished, thread, &QObject::deleteLater);
-    thread->start();
-}
-
 void showPlainWarning(const QString& text) {
     QMessageBox box(QMessageBox::Warning, QStringLiteral("limit-nvpstate"), text);
     box.setTextFormat(Qt::PlainText);
@@ -124,41 +115,37 @@ int main(int argc, char* argv[]) {
     QApplication::setAttribute(Qt::AA_EnableHighDpiScaling);
 
     const LaunchOptions launch      = parseLaunchOptions();
-    const bool          afterUpdate = launch.oldInstance != nullptr;
+    const bool          afterUpdate = launch.ready != nullptr;
     const std::wstring  appDir      = getProgramDirectory();
 
-    updater::Recovery recovery = updater::Recovery::None;
-    std::wstring      recoveryError;
+    // The updater helper is at work (swapping files, or deciding about a new
+    // version it started): it starts the program itself when it is done. Only
+    // the new version it starts gets past this.
+    if (!afterUpdate && updatetxn::updateLockHeld()) {
+        return 0;
+    }
 
-    // Started by an update, the old instance still holds the single-instance
-    // mutex: it waits for us to say we're up, then exits, and only then do we
-    // take the mutex. A normal start takes it first, then deals with anything
-    // an earlier update left behind.
+    if (!becomeSingleInstance()) {
+        return 0;
+    }
+
+    // An update the helper could not finish (a crash, a power cut): it is
+    // started again to undo it, and starts the program afterwards. This copy
+    // may be running a mix of old and new files, so it stops here, before
+    // touching config or the GPU.
+    std::wstring repairMessage;
+
     if (!afterUpdate) {
-        if (!becomeSingleInstance()) {
+        const updater::StartupState startup = updater::checkAtStartup(appDir, launch.recovered, repairMessage);
+
+        if (startup == updater::StartupState::Recovering) {
             return 0;
         }
 
-        recovery = updater::recoverAtStartup(appDir, recoveryError);
-    }
-
-    // This process is the new version of an update that was never confirmed.
-    // If it can't start, put the old version back so the next start works.
-    const auto failedToStart = [&]() {
-        if (recovery == updater::Recovery::PendingFinish) {
-            std::wstring error;
-            const bool   undone = updater::undoInstall(appDir, error);
-
-            MessageBoxW(nullptr,
-                        undone ? L"The new version could not start, so the update was undone. Start limit-nvpstate "
-                                 L"again to use the previous version."
-                               : (L"The new version could not start, and the update could not be fully undone.\n\n"
-                                  + error).c_str(),
-                        L"limit-nvpstate", MB_ICONERROR | MB_OK);
+        if (startup != updater::StartupState::NeedsRepair) {
+            repairMessage.clear();
         }
-
-        return 1;
-    };
+    }
 
     // ---- config ----
     // Paths are derived from the module path. The original chdir'd with
@@ -174,7 +161,7 @@ int main(int argc, char* argv[]) {
                     L"Check that the program directory is writable.",
                     L"limit-nvpstate",
                     MB_ICONERROR | MB_OK);
-        return failedToStart();
+        return 1;
     }
 
     // Qt's fallback session management closes every visible window at logoff
@@ -199,32 +186,17 @@ int main(int argc, char* argv[]) {
     limitnvpstate w;
 
     // Initialisation that can fail is no longer done in the constructor, so a
-    // failure returns here instead of calling exit() mid-construction. (After
-    // an update, the old instance sees us exit and undoes the update.)
+    // failure returns here instead of calling exit() mid-construction. (A new
+    // version that fails here never says it is up: the helper rolls back.)
     if (!w.init()) {
-        return failedToStart();
+        return 1;
     }
 
     if (afterUpdate) {
-        // Up: tell the old instance, which then exits. The old version had
-        // already released the GPU and stopped watching before starting us.
-        testPause(L"LIMITNV_TEST_PAUSE_BEFORE_READY");
-        SetEvent(launch.ready);
-        CloseHandle(launch.ready);
-        WaitForSingleObject(launch.oldInstance, 30000);
-        CloseHandle(launch.oldInstance);
-
-        if (!becomeSingleInstance()) {
-            // Another copy started in between and manages the GPU now; leave
-            // it alone rather than releasing it on the way out.
-            w.yieldGpu();
-            return 0;
-        }
+        w.signalReadyLater(launch.ready);
     }
 
-    if (afterUpdate || recovery == updater::Recovery::PendingFinish) {
-        finishUpdateInBackground(appDir);   // final: the backups can go
-    }
+    w.finishUpdateLater();
 
     // Auto-reset: each SetEvent from a second launch wakes us exactly once.
     // Created only after init() succeeded, so a launch during a failed start
@@ -236,27 +208,13 @@ int main(int argc, char* argv[]) {
         QObject::connect(notifier, &QWinEventNotifier::activated, &w, [&w]() { w.bringToFront(); });
     }
 
-    if (afterUpdate) {
-        w.showUpdatedNotice();
-    }
-
     if (launch.show || !config["start_minimized"].get<bool>()) {
         w.show();
     }
 
-    if (recovery == updater::Recovery::Undone) {
-        QTimer::singleShot(0, &w, []() {
-            showPlainWarning(QStringLiteral("An earlier update did not finish, so it was undone. You are on "
-                                            "version %1.").arg(QString::fromLatin1(APP_VERSION_STRING)));
-        });
-    } else if (recovery == updater::Recovery::NeedsRepair) {
-        const QString error = QString::fromStdWString(recoveryError);
-
-        QTimer::singleShot(0, &w, [error]() {
-            showPlainWarning(QStringLiteral("An earlier update did not finish, and it could not be fully undone.\n\n"
-                                            "%1\n\nIf limit-nvpstate misbehaves, download it again from:\n%2")
-                                 .arg(error, QString::fromWCharArray(updater::releasesPageUrl())));
-        });
+    if (!repairMessage.empty()) {
+        const QString text = QString::fromStdWString(repairMessage);
+        QTimer::singleShot(0, &w, [text]() { showPlainWarning(text); });
     }
 
     return a.exec();

@@ -132,8 +132,9 @@ bool undo(const std::wstring& appDir, std::wstring& error);
 
 // ---- cleanup (the app) ------------------------------------------------------
 
-// Renames the work folder to a unique tombstone, then deletes it. False if
-// there is nothing of ours to retire or the rename failed.
+// Renames the work folder to a unique tombstone (one atomic step; then
+// deleteTombstones() deletes it). False if there is nothing of ours to retire
+// or the rename failed.
 bool retire(const std::wstring& appDir);
 
 // Deletes tombstones left by an earlier run (only ones with owner.txt).

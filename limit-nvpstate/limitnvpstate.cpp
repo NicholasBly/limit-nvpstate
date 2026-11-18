@@ -7,6 +7,7 @@
 #include <nvidia.h>
 #include <pstatepolicy.h>
 #include <updater.h>
+#include <updatetxn.h>
 #include <updaterules.h>
 #include <utils.h>
 #include <version.h>
@@ -29,7 +30,6 @@
 #include <QThread>
 #include <QTimer>
 #include <QTreeWidget>
-#include <QWinEventNotifier>
 
 #include <tlhelp32.h>
 
@@ -1597,28 +1597,81 @@ void limitnvpstate::shutdown(int exitCode) {
     QCoreApplication::exit(exitCode);
 }
 
-void limitnvpstate::yieldGpu() {
-    {
-        StateGuard guard;
-        state.shuttingDown = true;
-    }
+void limitnvpstate::finishUpdateLater() {
+    struct Outcome {
+        bool    updated = false;
+        QString rolledBack;
+    };
 
-    stopAllTriggers();
+    auto               outcome = std::make_shared<Outcome>();
+    const std::wstring appDir  = getProgramDirectory();
 
-    StateGuard guard;
+    updateBusy = true;   // no new update until this one is retired
 
-    for (int& applied : state.applied) {
-        applied = APPLIED_NEVER;
-    }
+    runInBackground(this, [appDir, outcome]() {
+        using updaterules::Phase;
+
+        updatetxn::deleteTombstones(appDir);
+
+        // The helper holds the lock until it has decided -- for the new
+        // version, a few seconds after it said it is up.
+        for (int waited = 0; updatetxn::updateLockHeld() && waited < 120; waited++) {
+            Sleep(250);
+        }
+
+        if (updatetxn::updateLockHeld() || !updatetxn::ownsWorkDir(appDir)) {
+            return;
+        }
+
+        Phase        phase   = Phase::Swapping;
+        bool         present = false;
+        std::wstring error;
+
+        if (!updatetxn::readPhase(appDir, phase, present, error)) {
+            return;   // reported at startup; nothing is touched
+        }
+
+        if (present && phase == Phase::Committed) {
+            outcome->updated = true;
+            updatetxn::retire(appDir);
+        } else if (present && phase == Phase::RolledBack) {
+            outcome->rolledBack = QString::fromStdWString(updatetxn::readResult(appDir));
+            updatetxn::retire(appDir);
+        } else if (!present && !updatetxn::hasJournal(appDir)) {
+            updatetxn::retire(appDir);   // a download that was never installed
+        }
+        // Anything else is an update the helper still has to finish, or one
+        // that needs repair: left exactly as it is.
+    }, [this, outcome, appDir]() {
+        // The tombstone can wait out a locked file in the background; the
+        // outcome is shown now.
+        runInBackground(this, [appDir]() { updatetxn::deleteTombstones(appDir); }, [this]() { updateBusy = false; });
+
+        if (exiting) {
+            return;
+        }
+
+        if (outcome->updated && trayIcon) {
+            trayIcon->showMessage(QStringLiteral("limit-nvpstate"),
+                                  QStringLiteral("Updated to version %1.").arg(QString::fromLatin1(APP_VERSION_STRING)),
+                                  QSystemTrayIcon::Information,
+                                  5000);
+        }
+
+        if (!outcome->rolledBack.isEmpty()) {
+            showPlain(this, QMessageBox::Warning, outcome->rolledBack);
+        }
+    });
 }
 
-void limitnvpstate::showUpdatedNotice() {
-    if (trayIcon) {
-        trayIcon->showMessage(QStringLiteral("limit-nvpstate"),
-                              QStringLiteral("Updated to version %1.").arg(QString::fromLatin1(APP_VERSION_STRING)),
-                              QSystemTrayIcon::Information,
-                              5000);
-    }
+void limitnvpstate::signalReadyLater(HANDLE event) {
+    QTimer::singleShot(500, this, [event]() {
+        if (!fatalReported && !exiting && !SetEvent(event)) {
+            LOG(L"error: could not tell the updater we are up (%lu)\n", GetLastError());
+        }
+
+        CloseHandle(event);
+    });
 }
 
 void limitnvpstate::checkForUpdates() {
@@ -1765,217 +1818,54 @@ void limitnvpstate::startUpdate(const updater::Release& release) {
             return;
         }
 
-        // Swapping files does not disturb this running instance (in-use files
-        // are renamed, not overwritten), so the GPU stays managed until the
-        // restart.
-        std::wstring                 error;
-        const updater::InstallResult result = updater::install(job->packageDir, appDir, error);
+        // Hand over: the helper swaps the files once this process has exited,
+        // when nothing is in use. Stop watching and release the GPU first --
+        // the helper never touches it, and the next version starts from a
+        // released GPU.
+        {
+            StateGuard guard;
+            state.shuttingDown = true;
+        }
 
-        if (result == updater::InstallResult::RolledBack) {
-            discard();
-            showPlain(this, QMessageBox::Warning,
-                      QStringLiteral("The update could not be installed, so nothing was changed.\n\n%1")
-                          .arg(QString::fromStdWString(error)));
+        stopAllTriggers();
+
+        if (!releaseLimits()) {
+            resumeAfterFailedHandOff(QStringLiteral("Could not remove the P-State limit (%1), so the update was not "
+                                                    "installed.").arg(lastFailureText()));
             return;
         }
 
-        if (result == updater::InstallResult::NeedsRepair) {
-            updateBusy = false;
-            showPlain(this, QMessageBox::Critical,
-                      QStringLiteral("The update could not be installed, and the previous version could not be "
-                                     "fully put back.\n\n%1\n\nlimit-nvpstate will try again at its next start. "
-                                     "If that fails, download it again from:\n%2")
-                          .arg(QString::fromStdWString(error), QString::fromWCharArray(updater::releasesPageUrl())));
+        std::wstring error;
+
+        if (!updater::launchHelper(appDir, isVisible(), error)) {
+            resumeAfterFailedHandOff(QStringLiteral("The update was not installed.\n\n%1")
+                                         .arg(QString::fromStdWString(error)));
             return;
         }
 
-        restartIntoUpdate(QString::fromStdString(job->release.version));
+        beginExit();
+
+        if (trayIcon) {
+            trayIcon->hide();
+        }
+
+        QCoreApplication::exit(0);
     });
 }
 
-void limitnvpstate::abandonUpdate(const QString& reason) {
-    std::wstring error;
-    const bool   restored = updater::undoInstall(getProgramDirectory(), error);
-
-    updateBusy = false;   // busy from Update now until here (the restart)
-
-    // A restart sets shuttingDown and stops the detectors; take that back --
-    // unless the program started exiting meanwhile.
+void limitnvpstate::resumeAfterFailedHandOff(const QString& reason) {
     if (!exiting) {
         {
             StateGuard guard;
             state.shuttingDown = false;
         }
 
-        updateDetectors();
+        updateDetectors();   // the cache says "released", so the limit is sent again
     }
 
-    if (restored) {
-        showPlain(this, QMessageBox::Warning,
-                  QStringLiteral("%1\n\nThe update was undone. You are still on version %2.")
-                      .arg(reason, QString::fromLatin1(APP_VERSION_STRING)));
-    } else {
-        showPlain(this, QMessageBox::Critical,
-                  QStringLiteral("%1\n\nThe update could not be fully undone.\n\n%2\n\n"
-                                 "limit-nvpstate will try again at its next start. If that fails, download it "
-                                 "again from:\n%3")
-                      .arg(reason, QString::fromStdWString(error), QString::fromWCharArray(updater::releasesPageUrl())));
-    }
-}
-
-void limitnvpstate::restartIntoUpdate(const QString& version) {
-    {
-        StateGuard guard;
-        state.shuttingDown = true;
-    }
-
-    stopAllTriggers();
-
-    // Hand over a released GPU or not at all.
-    if (!releaseLimits()) {
-        abandonUpdate(QStringLiteral("Could not remove the P-State limit before restarting (%1).")
-                          .arg(lastFailureText()));
-        return;
-    }
-
-    // The new instance gets two handles of ours: this process (to wait for
-    // its exit -- a handle can't be confused with a reused PID) and an event
-    // it sets once it is up.
-    SECURITY_ATTRIBUTES inheritable = { sizeof(inheritable), nullptr, TRUE };
-    HANDLE              ready       = CreateEventW(&inheritable, TRUE, FALSE, nullptr);
-    HANDLE              self        = nullptr;
-
-    // SYNCHRONIZE to wait on it; QUERY_LIMITED_INFORMATION so the new
-    // instance can check it really is a process handle (GetProcessId).
-    if (!ready || !DuplicateHandle(GetCurrentProcess(), GetCurrentProcess(), GetCurrentProcess(), &self,
-                                   SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, TRUE, 0)) {
-        const DWORD error = GetLastError();
-
-        if (ready) CloseHandle(ready);
-
-        abandonUpdate(QStringLiteral("Could not prepare the restart (error %1).").arg(error));
-        return;
-    }
-
-    const std::wstring directory = getProgramDirectory();
-    const std::wstring exe       = directory + L"\\limit-nvpstate.exe";
-    std::wstring       command   = L"\"" + exe + L"\" --after-update "
-                           + std::to_wstring(reinterpret_cast<uintptr_t>(self)) + L" "
-                           + std::to_wstring(reinterpret_cast<uintptr_t>(ready));
-
-    if (isVisible()) {
-        command += L" --show";
-    }
-
-    // Only those two handles are inherited, nothing else of ours.
-    SIZE_T attributeSize = 0;
-    InitializeProcThreadAttributeList(nullptr, 1, 0, &attributeSize);
-
-    std::vector<char>            attributeBuffer(attributeSize);
-    LPPROC_THREAD_ATTRIBUTE_LIST attributes  = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attributeBuffer.data());
-    HANDLE                       inherited[] = { self, ready };
-
-    const bool attributesOk = attributeSize > 0 && InitializeProcThreadAttributeList(attributes, 1, 0, &attributeSize)
-                           && UpdateProcThreadAttribute(attributes, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherited,
-                                                        sizeof(inherited), nullptr, nullptr);
-
-    STARTUPINFOEXW startup        = {};
-    startup.StartupInfo.cb        = sizeof(startup);
-    startup.lpAttributeList       = attributes;
-    PROCESS_INFORMATION process   = {};
-
-    const BOOL  started     = attributesOk
-                         && CreateProcessW(exe.c_str(), command.data(), nullptr, nullptr, TRUE, EXTENDED_STARTUPINFO_PRESENT,
-                                           nullptr, directory.c_str(), &startup.StartupInfo, &process);
-    const DWORD launchError = GetLastError();
-
-    if (attributesOk) {
-        DeleteProcThreadAttributeList(attributes);
-    }
-
-    CloseHandle(self);   // the new process has its own copy now (or never will)
-
-    if (!started) {
-        CloseHandle(ready);
-        abandonUpdate(QStringLiteral("The new version could not be started (error %1).").arg(launchError));
-        return;
-    }
-
-    CloseHandle(process.hThread);
-
-    // Wait -- without blocking the window -- for "I'm up", the new process
-    // exiting, or a timeout.
-    struct Handover {
-        HANDLE              child   = nullptr;
-        HANDLE              ready   = nullptr;
-        QWinEventNotifier*  onReady = nullptr;
-        QWinEventNotifier*  onExit  = nullptr;
-        bool                settled = false;
-    };
-
-    auto handover   = std::make_shared<Handover>();
-    handover->child = process.hProcess;
-    handover->ready = ready;
-
-    QProgressDialog* dialog = makeProgressDialog(this, QStringLiteral("Starting version %1...").arg(version), 0);
-    dialog->setCancelButton(nullptr);
-
-    handover->onReady = new QWinEventNotifier(ready, dialog);
-    handover->onExit  = new QWinEventNotifier(process.hProcess, dialog);
-
-    QTimer* timeout = new QTimer(dialog);
-    timeout->setSingleShot(true);
-
-    const auto settle = [this, handover, dialog]() {
-        if (handover->settled) {
-            return;
-        }
-
-        handover->settled = true;
-        handover->onReady->setEnabled(false);
-        handover->onExit->setEnabled(false);
-        dismissProgressDialog(dialog);
-
-        // "Up" wins even if the new process has exited by now as well.
-        const bool up = WaitForSingleObject(handover->ready, 0) == WAIT_OBJECT_0;
-
-        if (up) {
-            updater::markConfirmed(getProgramDirectory());
-            CloseHandle(handover->ready);
-            CloseHandle(handover->child);
-
-            if (trayIcon) {
-                trayIcon->hide();
-            }
-
-            // The new instance waits for this process to exit, then takes over.
-            QCoreApplication::exit(0);
-            return;
-        }
-
-        // Not up: make sure it is gone before its files are taken out.
-        DWORD code = STILL_ACTIVE;
-        GetExitCodeProcess(handover->child, &code);
-
-        const bool exited = code != STILL_ACTIVE;
-
-        if (!exited) {
-            TerminateProcess(handover->child, 1);
-            WaitForSingleObject(handover->child, 10000);
-        }
-
-        CloseHandle(handover->ready);
-        CloseHandle(handover->child);
-
-        abandonUpdate(exited ? QStringLiteral("The new version stopped right after starting (exit code 0x%1).")
-                                   .arg(static_cast<qulonglong>(code), 0, 16)
-                             : QStringLiteral("The new version did not finish starting in time."));
-    };
-
-    connect(handover->onReady, &QWinEventNotifier::activated, this, settle);
-    connect(handover->onExit, &QWinEventNotifier::activated, this, settle);
-    connect(timeout, &QTimer::timeout, this, settle);
-    timeout->start(static_cast<int>(testValue(L"LIMITNV_TEST_HANDSHAKE_MS", 30000)));
+    const std::wstring appDir = getProgramDirectory();
+    runInBackground(this, [appDir]() { updater::discardDownload(appDir); }, [this]() { updateBusy = false; });
+    showPlain(this, QMessageBox::Warning, reason);
 }
 
 void limitnvpstate::closeEvent(QCloseEvent* event) {

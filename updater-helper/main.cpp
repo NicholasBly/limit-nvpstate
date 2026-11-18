@@ -125,9 +125,9 @@ std::wstring findAppDir() {
 }
 
 // Starts limit-nvpstate. `ready` (optional) is the one handle it inherits.
-HANDLE startApp(const std::wstring& appDir, bool show, HANDLE ready, DWORD& error) {
+HANDLE startApp(const std::wstring& appDir, bool show, HANDLE ready, DWORD& error, const wchar_t* extra = L"") {
     const std::wstring exe     = appDir + L"\\limit-nvpstate.exe";
-    std::wstring       command = L"\"" + exe + L"\"";
+    std::wstring       command = L"\"" + exe + L"\"" + extra;
 
     if (ready) {
         command += L" --after-update " + std::to_wstring(reinterpret_cast<uintptr_t>(ready));
@@ -177,9 +177,10 @@ HANDLE startApp(const std::wstring& appDir, bool show, HANDLE ready, DWORD& erro
 }
 
 // Starts the program normally and lets it go (it shows what happened).
+// "--recovered": it must not hand an unfinished update straight back to us.
 void restartApp(const std::wstring& appDir, bool show) {
     DWORD  error   = 0;
-    HANDLE process = startApp(appDir, show, nullptr, error);
+    HANDLE process = startApp(appDir, show, nullptr, error, L" --recovered");
 
     if (process) {
         CloseHandle(process);
@@ -387,8 +388,12 @@ int recover(const std::wstring& appDir, HANDLE waitFor, bool show) {
             result = 2;
         } else if (updatetxn::hasJournal(appDir)
                    && (!present || phase == Phase::Swapping || phase == Phase::Verifying
-                       || phase == Phase::RollingBack)) {
-            result = rollBack(appDir, L"An update was interrupted, so it was undone.");
+                       || phase == Phase::RollingBack || phase == Phase::NeedsRepair)) {
+            // Interrupted, or an earlier undo that couldn't finish (a file was
+            // locked): the undo checks every step, so trying again is safe.
+            result = rollBack(appDir, phase == Phase::NeedsRepair && present
+                                          ? L"An update could not be fully undone before; it was tried again."
+                                          : L"An update was interrupted.");
         }
     }
 
