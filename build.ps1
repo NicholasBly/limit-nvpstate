@@ -63,8 +63,18 @@ function Invoke-Build {
         return 1
     }
 
+    # The updater helper (second project in the solution); every release
+    # needs it, and the app refuses an update package without it.
+    $helperPath = ".\x64\Release\limit-nvpstate-updater.exe"
+
+    if (-not (Test-Path $helperPath)) {
+        Write-Host "error: $helperPath was not produced" -ForegroundColor Red
+        return 1
+    }
+
     # ---- stage ----
     Copy-Item $exePath          $stageDir
+    Copy-Item $helperPath       $stageDir
     Copy-Item ".\x64\Release\config.json" $stageDir
 
     # ---- Qt runtime ----

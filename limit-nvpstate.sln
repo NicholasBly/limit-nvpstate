@@ -5,6 +5,8 @@ VisualStudioVersion = 17.10.35013.160
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "limit-nvpstate", "limit-nvpstate\limit-nvpstate.vcxproj", "{DA845698-F42C-43C3-9097-27AB638198E6}"
 EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "limit-nvpstate-updater", "updater-helper\limit-nvpstate-updater.vcxproj", "{6F1C2A7E-3B9D-4E58-9C41-2D7A8B5E0F13}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|x64 = Debug|x64
@@ -15,6 +17,10 @@ Global
 		{DA845698-F42C-43C3-9097-27AB638198E6}.Debug|x64.Build.0 = Debug|x64
 		{DA845698-F42C-43C3-9097-27AB638198E6}.Release|x64.ActiveCfg = Release|x64
 		{DA845698-F42C-43C3-9097-27AB638198E6}.Release|x64.Build.0 = Release|x64
+		{6F1C2A7E-3B9D-4E58-9C41-2D7A8B5E0F13}.Debug|x64.ActiveCfg = Debug|x64
+		{6F1C2A7E-3B9D-4E58-9C41-2D7A8B5E0F13}.Debug|x64.Build.0 = Debug|x64
+		{6F1C2A7E-3B9D-4E58-9C41-2D7A8B5E0F13}.Release|x64.ActiveCfg = Release|x64
+		{6F1C2A7E-3B9D-4E58-9C41-2D7A8B5E0F13}.Release|x64.Build.0 = Release|x64
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
