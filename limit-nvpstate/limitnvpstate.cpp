@@ -5,7 +5,10 @@
 #include <log.h>
 #include <nvidia.h>
 #include <pstatepolicy.h>
+#include <updater.h>
+#include <updaterules.h>
 #include <utils.h>
+#include <version.h>
 
 #include <QAbstractNativeEventFilter>
 #include <QAction>
@@ -18,9 +21,12 @@
 #include <QIcon>
 #include <QMenu>
 #include <QMessageBox>
+#include <QProgressDialog>
 #include <QPushButton>
 #include <QSignalBlocker>
 #include <QSystemTrayIcon>
+#include <QThread>
+#include <QTimer>
 #include <QTreeWidget>
 
 #include <tlhelp32.h>
@@ -38,7 +44,9 @@
 #include <atomic>
 #include <cwchar>
 #include <iterator>
+#include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 // ===========================================================================
@@ -764,6 +772,54 @@ std::vector<ProcessEntry> updateProcessConfig(const QTreeWidget* list) {
 }
 
 // ---------------------------------------------------------------------------
+// Check for updates (GUI side helpers)
+// ---------------------------------------------------------------------------
+
+// Shared between the GUI and one background check/download. The worker only
+// writes this; the GUI reads the result after QThread::finished, and polls the
+// progress counters on a timer -- so the worker never touches a widget, and
+// quitting mid-download cannot leave it posting to a destroyed window.
+struct UpdateJob {
+    std::atomic<bool>      cancel{ false };
+    std::atomic<long long> received{ 0 };
+    std::atomic<long long> total{ -1 };
+
+    bool             ok = false;
+    std::wstring     error;
+    updater::Release release;
+    std::wstring     packageDir;
+    std::wstring     tempDir;
+};
+
+// Runs `work` on a new thread, then `done` on the GUI thread (via `context`).
+template <typename Work, typename Done>
+void runInBackground(QObject* context, Work work, Done done) {
+    QThread* thread = QThread::create(std::move(work));
+    QObject::connect(thread, &QThread::finished, context, std::move(done));
+    QObject::connect(thread, &QThread::finished, thread, &QObject::deleteLater);
+    thread->start();
+}
+
+QProgressDialog* makeProgressDialog(QWidget* parent, const QString& text, int maximum) {
+    QProgressDialog* dialog = new QProgressDialog(text, QStringLiteral("Cancel"), 0, maximum, parent);
+    dialog->setWindowTitle(QStringLiteral("limit-nvpstate"));
+    dialog->setWindowModality(Qt::WindowModal);
+    dialog->setMinimumDuration(0);
+    dialog->setAutoClose(false);
+    dialog->setAutoReset(false);
+    dialog->show();
+    return dialog;
+}
+
+// Not close(): QProgressDialog::closeEvent emits canceled(), which would read
+// as the user pressing Cancel and swallow the result.
+void dismissProgressDialog(QProgressDialog* dialog) {
+    QObject::disconnect(dialog, &QProgressDialog::canceled, nullptr, nullptr);
+    dialog->hide();
+    dialog->deleteLater();
+}
+
+// ---------------------------------------------------------------------------
 // Session end
 // ---------------------------------------------------------------------------
 
@@ -918,6 +974,9 @@ bool limitnvpstate::init() {
 
     // ---- File -> Exit ----
     connect(ui.actionExit, &QAction::triggered, this, [this]() { shutdown(0); });
+
+    // ---- Help -> Check for Updates ----
+    connect(ui.actionCheckForUpdates, &QAction::triggered, this, [this]() { checkForUpdates(); });
 
     // ---- Help -> About ----
     connect(ui.actionAbout, &QAction::triggered, this, [this]() {
@@ -1497,6 +1556,231 @@ void limitnvpstate::shutdown(int exitCode) {
     }
 
     QCoreApplication::exit(exitCode);
+}
+
+void limitnvpstate::showUpdatedNotice() {
+    if (trayIcon) {
+        trayIcon->showMessage(QStringLiteral("limit-nvpstate"),
+                              QStringLiteral("Updated to version %1.").arg(QString::fromLatin1(APP_VERSION_STRING)),
+                              QSystemTrayIcon::Information,
+                              5000);
+    }
+}
+
+void limitnvpstate::checkForUpdates() {
+    if (updateBusy) {
+        return;
+    }
+
+    updateBusy = true;
+
+    auto             job    = std::make_shared<UpdateJob>();
+    QProgressDialog* dialog = makeProgressDialog(this, QStringLiteral("Checking for updates..."), 0);
+
+    connect(dialog, &QProgressDialog::canceled, this, [job]() { job->cancel = true; });
+
+    runInBackground(this, [job]() {
+        job->ok = updater::fetchLatest(job->release, job->error);
+    }, [this, job, dialog]() {
+        dismissProgressDialog(dialog);
+        updateBusy = false;
+
+        if (job->cancel) {
+            return;
+        }
+
+        const QString current = QString::fromLatin1(APP_VERSION_STRING);
+
+        if (!job->ok) {
+            QMessageBox::warning(this,
+                                 QStringLiteral("limit-nvpstate"),
+                                 QStringLiteral("Could not check for updates.\n\n%1\n\nReleases: %2")
+                                     .arg(QString::fromStdWString(job->error),
+                                          QString::fromWCharArray(updater::releasesPageUrl())));
+            return;
+        }
+
+        const QString latest = QString::fromStdString(job->release.version);
+        const QString notes  = QString::fromStdWString(job->release.pageUrl);
+
+        if (!updaterules::isNewer(job->release.version, APP_VERSION_STRING)) {
+            QMessageBox::information(this,
+                                     QStringLiteral("limit-nvpstate"),
+                                     QStringLiteral("You have the latest version (%1).").arg(current));
+            return;
+        }
+
+        if (job->release.checksumUrl.empty()) {
+            QMessageBox::information(this,
+                                     QStringLiteral("limit-nvpstate"),
+                                     QStringLiteral("Version %1 is available (you have %2).\n\n"
+                                                    "This release has no checksum file, so it can't be installed "
+                                                    "automatically. Download it from:\n%3")
+                                         .arg(latest, current, notes));
+            return;
+        }
+
+        // The release page is shown as text, not opened: a browser started
+        // from this elevated program would run elevated too.
+        QMessageBox box(this);
+        box.setWindowTitle(QStringLiteral("limit-nvpstate"));
+        box.setIcon(QMessageBox::Information);
+        box.setText(QStringLiteral("Version %1 is available (you have %2).").arg(latest, current));
+        box.setInformativeText(QStringLiteral("Release notes: %1\n\n"
+                                              "Updating restarts limit-nvpstate. Your settings are kept.").arg(notes));
+        box.setTextInteractionFlags(Qt::TextSelectableByMouse);
+
+        QPushButton* updateNow = box.addButton(QStringLiteral("Update now"), QMessageBox::AcceptRole);
+        box.addButton(QStringLiteral("Later"), QMessageBox::RejectRole);
+        box.exec();
+
+        if (box.clickedButton() == updateNow) {
+            startUpdate(job->release);
+        }
+    });
+}
+
+void limitnvpstate::startUpdate(const updater::Release& release) {
+    if (updateBusy) {
+        return;
+    }
+
+    updateBusy = true;
+
+    auto job     = std::make_shared<UpdateJob>();
+    job->release = release;
+
+    QProgressDialog* dialog = makeProgressDialog(
+        this, QStringLiteral("Downloading version %1...").arg(QString::fromStdString(release.version)), 100);
+
+    connect(dialog, &QProgressDialog::canceled, this, [job]() { job->cancel = true; });
+
+    QTimer* ticker = new QTimer(dialog);
+    connect(ticker, &QTimer::timeout, dialog, [job, dialog]() {
+        const long long total    = job->total;
+        const long long received = job->received;
+
+        if (total > 0) {
+            dialog->setMaximum(100);
+            dialog->setValue(static_cast<int>(received * 100 / total));
+        } else {
+            dialog->setMaximum(0);   // busy indicator
+        }
+    });
+    ticker->start(100);
+
+    runInBackground(this, [job]() {
+        job->ok = updater::prepare(job->release, job->packageDir, job->tempDir, job->error,
+                                   [job](long long received, long long total) {
+                                       job->received = received;
+                                       job->total    = total;
+                                       return !job->cancel.load();
+                                   });
+    }, [this, job, dialog]() {
+        dismissProgressDialog(dialog);
+        updateBusy = false;
+
+        if (!job->ok) {
+            updater::removeTree(job->tempDir);
+
+            if (!job->cancel) {
+                QMessageBox::warning(this,
+                                     QStringLiteral("limit-nvpstate"),
+                                     QStringLiteral("The update was not installed.\n\n%1")
+                                         .arg(QString::fromStdWString(job->error)));
+            }
+
+            return;
+        }
+
+        // Swapping files does not disturb this running instance (in-use files
+        // are renamed, not overwritten), so the GPU stays managed until the
+        // restart. A failure is rolled back completely.
+        std::wstring            error;
+        updater::InstallJournal journal;
+        const bool installed = updater::install(job->packageDir, getProgramDirectory(), journal, error);
+
+        updater::removeTree(job->tempDir);
+
+        if (!installed) {
+            QMessageBox::warning(this,
+                                 QStringLiteral("limit-nvpstate"),
+                                 QStringLiteral("The update could not be installed, so nothing was changed.\n\n%1")
+                                     .arg(QString::fromStdWString(error)));
+            return;
+        }
+
+        restartIntoUpdate(journal);
+    });
+}
+
+bool limitnvpstate::restartIntoUpdate(const updater::InstallJournal& installed) {
+    {
+        StateGuard guard;
+        state.shuttingDown = true;
+    }
+
+    stopAllTriggers();
+    releaseLimits();
+
+    const std::wstring directory = getProgramDirectory();
+    const std::wstring exe       = directory + L"\\limit-nvpstate.exe";
+    std::wstring       command   = L"\"" + exe + L"\" --after-update " + std::to_wstring(GetCurrentProcessId());
+
+    if (isVisible()) {
+        command += L" --show";
+    }
+
+    STARTUPINFOW        startup = {};
+    PROCESS_INFORMATION process = {};
+    startup.cb                  = sizeof(startup);
+
+    if (CreateProcessW(exe.c_str(), command.data(), nullptr, nullptr, FALSE, 0, nullptr, directory.c_str(), &startup,
+                       &process)) {
+        CloseHandle(process.hThread);
+        CloseHandle(process.hProcess);
+
+        if (trayIcon) {
+            trayIcon->hide();
+        }
+
+        // The new instance waits for this process to exit before it starts.
+        QCoreApplication::exit(0);
+        return true;
+    }
+
+    const DWORD error = GetLastError();
+
+    // The new version won't start (a broken release, or a virus scanner took
+    // the new exe). This copy is still running, so put the old files back --
+    // otherwise the next start would hit the same broken exe -- and carry on.
+    const bool restored = updater::undoInstall(installed);
+
+    {
+        StateGuard guard;
+        state.shuttingDown = false;
+    }
+
+    updateDetectors();
+
+    if (restored) {
+        QMessageBox::warning(this,
+                             QStringLiteral("limit-nvpstate"),
+                             QStringLiteral("The new version could not be started (error %1), so the update was "
+                                            "undone. You are still on version %2.")
+                                 .arg(error)
+                                 .arg(QString::fromLatin1(APP_VERSION_STRING)));
+    } else {
+        QMessageBox::warning(this,
+                             QStringLiteral("limit-nvpstate"),
+                             QStringLiteral("The new version could not be started (error %1), and the old files "
+                                            "could not all be put back. Please download limit-nvpstate again "
+                                            "from:\n%2")
+                                 .arg(error)
+                                 .arg(QString::fromWCharArray(updater::releasesPageUrl())));
+    }
+
+    return false;
 }
 
 void limitnvpstate::closeEvent(QCloseEvent* event) {

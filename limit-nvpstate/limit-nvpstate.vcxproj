@@ -16,6 +16,8 @@
     <WindowsTargetPlatformVersion Condition="'$(Configuration)|$(Platform)' == 'Debug|x64'">10.0</WindowsTargetPlatformVersion>
     <WindowsTargetPlatformVersion Condition="'$(Configuration)|$(Platform)' == 'Release|x64'">10.0</WindowsTargetPlatformVersion>
     <QtMsBuild Condition="'$(QtMsBuild)'=='' OR !Exists('$(QtMsBuild)\qt.targets')">$(SolutionDir)QtMsBuild</QtMsBuild>
+    <!-- Program version, compiled in as APP_VERSION (see version.h). build.ps1 -Version overrides it. -->
+    <AppVersion Condition="'$(AppVersion)' == ''">5.3.0-dev</AppVersion>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)' == 'Debug|x64'" Label="Configuration">
@@ -93,7 +95,7 @@
       <ConformanceMode>true</ConformanceMode>
       <WarningLevel>Level3</WarningLevel>
       <SDLCheck>true</SDLCheck>
-      <PreprocessorDefinitions>NDEBUG;WIN32_LEAN_AND_MEAN;NOMINMAX;QT_NO_DEBUG;QT_NO_DEBUG_OUTPUT;QT_NO_INFO_OUTPUT;QT_NO_WARNING_OUTPUT;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>APP_VERSION=$(AppVersion);NDEBUG;WIN32_LEAN_AND_MEAN;NOMINMAX;QT_NO_DEBUG;QT_NO_DEBUG_OUTPUT;QT_NO_INFO_OUTPUT;QT_NO_WARNING_OUTPUT;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <AdditionalOptions>/Gw /Zc:inline /utf-8 %(AdditionalOptions)</AdditionalOptions>
       <AdditionalIncludeDirectories>%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
@@ -108,7 +110,7 @@
         useless one. build.ps1 does not copy it into the package.
       -->
       <GenerateDebugInformation>DebugFull</GenerateDebugInformation>
-      <AdditionalDependencies>$(SolutionDir)nvapi\amd64\nvapi64.lib;Shlwapi.lib;Kernel32.lib;Advapi32.lib;User32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>$(SolutionDir)nvapi\amd64\nvapi64.lib;Shlwapi.lib;Kernel32.lib;Advapi32.lib;User32.lib;Winhttp.lib;Bcrypt.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <UACExecutionLevel>RequireAdministrator</UACExecutionLevel>
     </Link>
   </ItemDefinitionGroup>
@@ -120,14 +122,14 @@
       <ConformanceMode>true</ConformanceMode>
       <WarningLevel>Level3</WarningLevel>
       <SDLCheck>true</SDLCheck>
-      <PreprocessorDefinitions>_DEBUG;WIN32_LEAN_AND_MEAN;NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>APP_VERSION=$(AppVersion);_DEBUG;WIN32_LEAN_AND_MEAN;NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
       <AdditionalIncludeDirectories>%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>$(SolutionDir)nvapi\amd64\nvapi64.lib;Shlwapi.lib;Kernel32.lib;Advapi32.lib;User32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>$(SolutionDir)nvapi\amd64\nvapi64.lib;Shlwapi.lib;Kernel32.lib;Advapi32.lib;User32.lib;Winhttp.lib;Bcrypt.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <UACExecutionLevel>RequireAdministrator</UACExecutionLevel>
     </Link>
   </ItemDefinitionGroup>
@@ -136,6 +138,8 @@
     <ClCompile Include="config.cpp" />
     <ClCompile Include="nvidia.cpp" />
     <ClCompile Include="pstatepolicy.cpp" />
+    <ClCompile Include="updater.cpp" />
+    <ClCompile Include="updaterules.cpp" />
     <ClCompile Include="utils.cpp" />
     <QtRcc Include="limitnvpstate.qrc" />
     <QtUic Include="about.ui" />
@@ -151,7 +155,10 @@
     <ClInclude Include="nvidia.h" />
     <ClInclude Include="pstatepolicy.h" />
     <ClInclude Include="resource.h" />
+    <ClInclude Include="updater.h" />
+    <ClInclude Include="updaterules.h" />
     <ClInclude Include="utils.h" />
+    <ClInclude Include="version.h" />
   </ItemGroup>
   <ItemGroup>
     <CopyFileToFolders Include="config.json">

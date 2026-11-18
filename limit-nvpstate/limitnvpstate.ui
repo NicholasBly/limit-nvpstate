@@ -153,6 +153,8 @@
     <property name="title">
      <string>Help</string>
     </property>
+    <addaction name="actionCheckForUpdates"/>
+    <addaction name="separator"/>
     <addaction name="actionAbout"/>
    </widget>
    <addaction name="menuFile"/>
@@ -177,6 +179,11 @@
   <action name="actionExit">
    <property name="text">
     <string>Exit</string>
+   </property>
+  </action>
+  <action name="actionCheckForUpdates">
+   <property name="text">
+    <string>Check for Updates...</string>
    </property>
   </action>
   <action name="actionAbout">

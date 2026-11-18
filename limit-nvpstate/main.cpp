@@ -1,13 +1,18 @@
 #include <limitnvpstate.h>
 
 #include <config.h>
+#include <updater.h>
 #include <utils.h>
+#include <version.h>
 
 #include <QApplication>
 #include <QIcon>
 #include <QWinEventNotifier>
 
 #include <Windows.h>
+#include <shellapi.h>
+
+#include <cwchar>
 
 namespace {
 
@@ -18,10 +23,50 @@ namespace {
 // Qt's back so Qt still thinks it is hidden.
 constexpr wchar_t SHOW_EVENT_NAME[] = L"Local\\limit-nvpstate-show";
 
+// Set by an update: "--after-update <pid of the old instance> [--show]".
+struct LaunchOptions {
+    DWORD afterUpdatePid = 0;
+    bool  show           = false;
+};
+
+LaunchOptions parseLaunchOptions() {
+    LaunchOptions options;
+    int           count = 0;
+    LPWSTR*       args  = CommandLineToArgvW(GetCommandLineW(), &count);
+
+    if (!args) {
+        return options;
+    }
+
+    for (int i = 1; i < count; i++) {
+        if (wcscmp(args[i], L"--after-update") == 0 && i + 1 < count) {
+            options.afterUpdatePid = static_cast<DWORD>(wcstoul(args[++i], nullptr, 10));
+        } else if (wcscmp(args[i], L"--show") == 0) {
+            options.show = true;
+        }
+    }
+
+    LocalFree(args);
+    return options;
+}
+
 } // namespace
 
 int main(int argc, char* argv[]) {
     QApplication::setAttribute(Qt::AA_EnableHighDpiScaling);
+
+    const LaunchOptions launch = parseLaunchOptions();
+
+    // Started by an update: the old instance still holds the single-instance
+    // mutex for a moment. Wait for it to exit (bounded) before taking it.
+    if (launch.afterUpdatePid != 0) {
+        const HANDLE oldInstance = OpenProcess(SYNCHRONIZE, FALSE, launch.afterUpdatePid);
+
+        if (oldInstance) {
+            WaitForSingleObject(oldInstance, 15000);
+            CloseHandle(oldInstance);
+        }
+    }
 
     // ---- single instance ----
     // The handle is intentionally left open for the process lifetime; Windows
@@ -70,6 +115,7 @@ int main(int argc, char* argv[]) {
     QGuiApplication::setFallbackSessionManagementEnabled(false);
 
     QApplication a(argc, argv);
+    QCoreApplication::setApplicationVersion(QString::fromLatin1(APP_VERSION_STRING));
 
     // This is a tray application. Without this, closing the About dialog while
     // the main window is hidden counts as "last window closed" and quits.
@@ -97,7 +143,14 @@ int main(int argc, char* argv[]) {
         QObject::connect(notifier, &QWinEventNotifier::activated, &w, [&w]() { w.bringToFront(); });
     }
 
-    if (!config["start_minimized"].get<bool>()) {
+    // Files an earlier update set aside ("*.old") are no longer in use now.
+    updater::removeLeftovers(getProgramDirectory());
+
+    if (launch.afterUpdatePid != 0) {
+        w.showUpdatedNotice();
+    }
+
+    if (launch.show || !config["start_minimized"].get<bool>()) {
         w.show();
     }
 

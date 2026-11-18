@@ -2,6 +2,8 @@
 
 #include <ui_limitnvpstate.h>
 
+#include <updater.h>
+
 #include <vector>
 
 class QComboBox;
@@ -32,18 +34,33 @@ public:
     // then leave the event loop.
     void shutdown(int exitCode);
 
+    // Tray balloon after an in-app update restarted the program.
+    void showUpdatedNotice();
+
 private:
     Ui::limitnvpstateClass ui;
     QSystemTrayIcon*       trayIcon = nullptr;
 
-    // Limitable P-States of the selected GPU (P0 excluded), in driver order.
+    // Limitable P-States of the selected GPU (P0 excluded), ascending.
     std::vector<int> availablePStates;
 
+    // A check or download is running (the menu item does nothing meanwhile).
+    bool updateBusy = false;
+
+    // Help -> Check for Updates: ask GitHub in the background, then offer.
+    void checkForUpdates();
+
+    // Download and verify in the background, swap files, restart.
+    void startUpdate(const updater::Release& release);
+
+    // Release the GPU, start the freshly installed exe, quit. False (with the
+    // program left running normally) if the new exe could not be started.
+    bool restartIntoUpdate(const updater::InstallJournal& installed);
     bool fail(const char* message);
     void createTrayIcon();
     void saveProcessExceptions();
 
-    // One exception-list row: the exe name plus its "When behind" combo.
+    // One exception-list row: the exe name plus its per-app combo.
     void addProcessRow(const QString& name, int background);
     void fillBackgroundCombo(QComboBox* combo, int background) const;
 
@@ -55,7 +72,7 @@ private:
     // false, after showing an error, if NVAPI cannot list them.
     bool queryPStates(int gpuIndex, std::vector<int>& available);
 
-    // Shows them in the Limit P-State combo and the rows' "When behind"
+    // Shows them in the Limit P-State combo and the rows' per-app
     // combos, with `selected` chosen. UI and config.json only: callers update
     // the shared state themselves.
     void showPStates(const std::vector<int>& available, int selected);

@@ -26,6 +26,15 @@ jobs:
       QtMsBuild: ${{ github.workspace }}\QtMSBuild
 
     steps:
+      - name: Check the version input
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          if ($env:VERSION -notmatch '^\d+(\.\d+){0,3}$') {
+            Write-Host "error: version must look like 5.3.0 (got '$env:VERSION')"
+            exit 1
+          }
+
       - name: Checkout repository
         uses: actions/checkout@v4
 
@@ -63,13 +72,29 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           .\policy_test.exe
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cl /nologo /std:c++17 /EHsc /W4 /utf-8 "/I$src\limit-nvpstate" "$src\tests\updaterules_test.cpp" "$src\limit-nvpstate\updaterules.cpp" /Fe:updaterules_test.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .\updaterules_test.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Pop-Location
 
       - name: Build
-        run: .\build.ps1
+        env:
+          VERSION: ${{ inputs.version }}
+        run: .\build.ps1 -Version $env:VERSION
 
+      # Check for Updates reads these two assets: the program zip and
+      # "<zip>.sha256" (sha256sum format). Without the checksum file it refuses
+      # to install automatically.
       - name: Zip release
-        run: Compress-Archive -Path build\limit-nvpstate -DestinationPath limit-nvpstate.zip
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          $zip = "limit-nvpstate-$env:VERSION.zip"
+          Compress-Archive -Path build\limit-nvpstate -DestinationPath $zip
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          [IO.File]::WriteAllText("$zip.sha256", "$hash  $zip`n")
+          Get-Content "$zip.sha256"
 
       - name: Create release
         uses: ncipollo/release-action@v1
@@ -77,5 +102,5 @@ jobs:
           tag: ${{ inputs.version }}
           name: limit-nvpstate v${{ inputs.version }}
           prerelease: ${{ inputs.pre-release }}
-          artifacts: limit-nvpstate.zip
+          artifacts: limit-nvpstate-${{ inputs.version }}.zip,limit-nvpstate-${{ inputs.version }}.zip.sha256
           generateReleaseNotes: true

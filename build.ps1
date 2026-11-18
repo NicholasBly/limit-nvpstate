@@ -1,5 +1,16 @@
 #Requires -Version 5.1
+param(
+    # Compiled in as the program version (About box, Check for updates).
+    # Empty: the project's default (a -dev version).
+    [string] $Version = ""
+)
+
 $ErrorActionPreference = "Stop"
+
+if ($Version -and $Version -notmatch '^\d+(\.\d+){0,3}$') {
+    Write-Host "error: -Version must look like 5.3.0 (got '$Version')" -ForegroundColor Red
+    exit 1
+}
 
 # ---------------------------------------------------------------------------
 # Changes from the original:
@@ -29,9 +40,13 @@ function Invoke-Build {
     New-Item -ItemType Directory -Path $stageDir -Force | Out-Null
 
     # ---- compile ----
+    $versionArgs = @()
+    if ($Version) { $versionArgs = @("-p:AppVersion=$Version") }
+
     MSBuild.exe ".\limit-nvpstate.sln" `
         -p:Configuration=Release `
         -p:Platform=x64 `
+        @versionArgs `
         -m `
         -nologo `
         -v:minimal | Out-Host

@@ -58,6 +58,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           .\policy_test.exe
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cl /nologo /std:c++17 /EHsc /W4 /utf-8 "/I$src\limit-nvpstate" "$src\tests\updaterules_test.cpp" "$src\limit-nvpstate\updaterules.cpp" /Fe:updaterules_test.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .\updaterules_test.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Pop-Location
 
       - name: Build

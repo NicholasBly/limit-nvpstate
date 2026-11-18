@@ -52,6 +52,12 @@
     <ClCompile Include="pstatepolicy.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="updater.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="updaterules.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="about.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -70,6 +76,15 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="pstatepolicy.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="updater.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="updaterules.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="version.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="log.h">
