@@ -4,6 +4,8 @@
 
 #include <updater.h>
 
+#include <Windows.h>   // HANDLE (signalReadyLater)
+
 #include <vector>
 
 class QComboBox;
