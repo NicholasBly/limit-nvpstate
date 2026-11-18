@@ -37,6 +37,11 @@ public:
     // Tray balloon after an in-app update restarted the program.
     void showUpdatedNotice();
 
+    // Another instance took over the GPU while this one was starting (only
+    // possible right after an update): stop watching and forget what was
+    // applied, so exiting does not release the limit the other one now owns.
+    void yieldGpu();
+
 private:
     Ui::limitnvpstateClass ui;
     QSystemTrayIcon*       trayIcon = nullptr;
@@ -53,9 +58,14 @@ private:
     // Download and verify in the background, swap files, restart.
     void startUpdate(const updater::Release& release);
 
-    // Release the GPU, start the freshly installed exe, quit. False (with the
-    // program left running normally) if the new exe could not be started.
-    bool restartIntoUpdate(const updater::InstallJournal& installed);
+    // Release the GPU, start the freshly installed exe and wait (without
+    // blocking) for it to say it is up; then quit. If it never does, undo the
+    // update and carry on.
+    void restartIntoUpdate(const QString& version);
+
+    // The installed update is not going ahead: put the old files back, resume
+    // (unless the program is exiting anyway) and say why.
+    void abandonUpdate(const QString& reason);
     bool fail(const char* message);
     void createTrayIcon();
     void saveProcessExceptions();

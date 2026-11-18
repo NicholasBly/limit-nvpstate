@@ -193,9 +193,21 @@ bool initConfig(const std::wstring& directory) {
         // cost the user their settings. If even the copy fails, do not write
         // over the original at all; initConfig then reports failure.
         if (read != ReadResult::Missing) {
-            const std::wstring backupPath = configPath + L".bak";
+            // A new name each time (config.json.bak, .bak2, .bak3...): a second
+            // broken file must not overwrite the backup of the first.
+            bool backedUp = false;
 
-            if (!CopyFileW(configPath.c_str(), backupPath.c_str(), FALSE)) {
+            for (int n = 1; n <= 100 && !backedUp; n++) {
+                const std::wstring backupPath = configPath + L".bak" + (n == 1 ? L"" : std::to_wstring(n));
+
+                if (CopyFileW(configPath.c_str(), backupPath.c_str(), TRUE)) {
+                    backedUp = true;
+                } else if (GetLastError() != ERROR_FILE_EXISTS && GetLastError() != ERROR_ALREADY_EXISTS) {
+                    break;
+                }
+            }
+
+            if (!backedUp) {
                 LOG(L"error: could not back up the unusable config.json (%lu)\n", GetLastError());
                 saveBlocked = true;
             }

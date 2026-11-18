@@ -30,7 +30,7 @@ jobs:
         env:
           VERSION: ${{ inputs.version }}
         run: |
-          if ($env:VERSION -notmatch '^\d+(\.\d+){0,3}$') {
+          if ($env:VERSION -notmatch '^[0-9]{1,9}(\.[0-9]{1,9}){0,3}$') {
             Write-Host "error: version must look like 5.3.0 (got '$env:VERSION')"
             exit 1
           }

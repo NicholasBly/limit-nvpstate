@@ -7,7 +7,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-if ($Version -and $Version -notmatch '^\d+(\.\d+){0,3}$') {
+if ($Version -and $Version -notmatch '^[0-9]{1,9}(\.[0-9]{1,9}){0,3}$') {
     Write-Host "error: -Version must look like 5.3.0 (got '$Version')" -ForegroundColor Red
     exit 1
 }
