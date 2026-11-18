@@ -140,6 +140,7 @@
     <ClCompile Include="pstatepolicy.cpp" />
     <ClCompile Include="updater.cpp" />
     <ClCompile Include="updaterules.cpp" />
+    <ClCompile Include="updatetxn.cpp" />
     <ClCompile Include="utils.cpp" />
     <QtRcc Include="limitnvpstate.qrc" />
     <QtUic Include="about.ui" />
@@ -157,6 +158,7 @@
     <ClInclude Include="resource.h" />
     <ClInclude Include="updater.h" />
     <ClInclude Include="updaterules.h" />
+    <ClInclude Include="updatetxn.h" />
     <ClInclude Include="testhooks.h" />
     <ClInclude Include="utils.h" />
     <ClInclude Include="version.h" />
