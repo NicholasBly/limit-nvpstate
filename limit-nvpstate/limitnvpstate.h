@@ -22,8 +22,8 @@ public:
     bool init();
 
     // Releases the limit on every GPU we touched and stops any further
-    // limiting. Safe to call twice.
-    void releaseLimits();
+    // limiting. Safe to call twice. Returns false if the driver refused any.
+    bool releaseLimits();
 
     // Show, un-minimise and focus the window (tray click, second launch).
     void bringToFront();

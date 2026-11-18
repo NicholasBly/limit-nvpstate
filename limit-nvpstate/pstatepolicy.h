@@ -46,9 +46,10 @@ struct Detectors {
     bool hook;   // foreground-window hook
 };
 
-// The trigger picks one detector. Any non-Default "When behind" row needs both,
-// because it has to tell "in front" apart from "open but behind".
-Detectors detectorsFor(Trigger trigger, bool anyOverride);
+// The trigger picks one detector. Any non-Default per-app row needs both,
+// because it has to tell "in front" apart from "open but behind". An empty
+// list needs neither: the answer is always the global limit.
+Detectors detectorsFor(Trigger trigger, bool anyOverride, bool anyEntries);
 
 // Nearest P-State the GPU actually offers. Ties go to the higher number (less
 // power). BACKGROUND_DEFAULT and Unlimited pass through untouched, and so does

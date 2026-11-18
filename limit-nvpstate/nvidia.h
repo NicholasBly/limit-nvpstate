@@ -12,7 +12,7 @@ inline constexpr unsigned int NV_PSTATE_CLIENT_LIMIT_TYPE = 3;
 int initNvAPI();
 
 // Raw NvAPI_GPU_SetPstateClientLimits: `limit` is the P-State number to cap
-// at, 0 removes the cap. Returns 0 on success.
+// at, 0 removes the cap. Returns the NvAPI_Status: 0 (NVAPI_OK) on success.
 //
 // No caching here. limitnvpstate.cpp remembers what each GPU was last set to,
 // per GPU, under the same lock that decides the target. The earlier single

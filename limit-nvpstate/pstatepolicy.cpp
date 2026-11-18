@@ -50,7 +50,11 @@ bool runningContributesUnlimited(const std::vector<EntryState>& entries, Trigger
     return false;
 }
 
-Detectors detectorsFor(Trigger trigger, bool anyOverride) {
+Detectors detectorsFor(Trigger trigger, bool anyOverride, bool anyEntries) {
+    if (!anyEntries) {
+        return { false, false };
+    }
+
     return {
         trigger == Trigger::ProcessRunning    || anyOverride,
         trigger == Trigger::ProcessForeground || anyOverride,

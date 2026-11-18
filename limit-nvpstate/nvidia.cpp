@@ -27,8 +27,11 @@ int initNvAPI() {
     // extra refcount that is never released.
     hNvAPI = GetModuleHandleW(L"nvapi64.dll");
 
+    // Fallback only. The driver installs nvapi64.dll in System32, so never
+    // let the ordinary search order (which starts with our own folder) pick
+    // up some other file of that name in an elevated process.
     if (!hNvAPI) {
-        hNvAPI = LoadLibraryW(L"nvapi64.dll");
+        hNvAPI = LoadLibraryExW(L"nvapi64.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
     }
 
     if (!hNvAPI) {
@@ -59,14 +62,16 @@ int initNvAPI() {
 
 int setPStateLimit(NvPhysicalGpuHandle hPhysicalGpu, unsigned int limit) {
     if (!pfnSetPstateLimits || !hPhysicalGpu) {
-        return 1;
+        return NVAPI_INVALID_ARGUMENT;
     }
 
-    if (pfnSetPstateLimits(hPhysicalGpu, NV_PSTATE_CLIENT_LIMIT_TYPE, limit) != 0) {
-        LOG(L"error: NvAPI_GPU_SetPstateClientLimits(P%u) failed\n", limit);
-        return 1;
+    const int status = static_cast<int>(pfnSetPstateLimits(hPhysicalGpu, NV_PSTATE_CLIENT_LIMIT_TYPE, limit));
+
+    if (status != NVAPI_OK) {
+        LOG(L"error: NvAPI_GPU_SetPstateClientLimits(P%u) failed (%d)\n", limit, status);
+        return status;
     }
 
     LOG(L"info: set P%u\n", limit);
-    return 0;
+    return NVAPI_OK;
 }

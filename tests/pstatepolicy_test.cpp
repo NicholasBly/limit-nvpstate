@@ -7,6 +7,7 @@
 
 #include <pstatepolicy.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <vector>
 
@@ -115,14 +116,35 @@ void runningContributesUnlimited_cases() {
 }
 
 void detectorsFor_cases() {
-    CHECK_EQ(detectorsFor(RUN, false).poll, true);
-    CHECK_EQ(detectorsFor(RUN, false).hook, false);
-    CHECK_EQ(detectorsFor(FG,  false).poll, false);
-    CHECK_EQ(detectorsFor(FG,  false).hook, true);
+    CHECK_EQ(detectorsFor(RUN, false, true).poll, true);
+    CHECK_EQ(detectorsFor(RUN, false, true).hook, false);
+    CHECK_EQ(detectorsFor(FG,  false, true).poll, false);
+    CHECK_EQ(detectorsFor(FG,  false, true).hook, true);
     for (Trigger t : { RUN, FG }) {
-        CHECK_EQ(detectorsFor(t, true).poll, true);
-        CHECK_EQ(detectorsFor(t, true).hook, true);
+        CHECK_EQ(detectorsFor(t, true, true).poll, true);
+        CHECK_EQ(detectorsFor(t, true, true).hook, true);
     }
+}
+
+// Nothing in the list: nothing to watch, in either mode.
+void detectorsFor_emptyList_needsNone() {
+    for (Trigger t : { RUN, FG }) {
+        CHECK_EQ(detectorsFor(t, false, false).poll, false);
+        CHECK_EQ(detectorsFor(t, false, false).hook, false);
+    }
+}
+
+// Fastest wins regardless of row order.
+void computeTarget_orderDoesNotMatter() {
+    const std::vector<EntryState> rows = { behind(5), behind(3), inFront(D), closed(2), behind(12) };
+    std::vector<int> idx = { 0, 1, 2, 3, 4 };
+    const int expected = computeTarget(rows, FG, GLOBAL);
+    CHECK_EQ(expected, 0);
+    do {
+        std::vector<EntryState> permuted;
+        for (int i : idx) permuted.push_back(rows[static_cast<size_t>(i)]);
+        CHECK_EQ(computeTarget(permuted, FG, GLOBAL), expected);
+    } while (std::next_permutation(idx.begin(), idx.end()));
 }
 
 void snap_cases() {
@@ -160,6 +182,8 @@ int main() {
     defaultRows_matchOriginalProgram();
     runningContributesUnlimited_cases();
     detectorsFor_cases();
+    detectorsFor_emptyList_needsNone();
+    computeTarget_orderDoesNotMatter();
     snap_cases();
     sanitizeBackground_rejectsBadValues();
 
