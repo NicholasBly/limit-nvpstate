@@ -348,7 +348,7 @@ void zipProblem_cases() {
     };
     auto extra = fullPackage();
     TestEntry loose; loose.name = "readme.txt"; loose.data = "x"; extra.push_back(loose);
-    CHECK_EQ(problemWith(extra).empty(), false);                       // a file outside the top folder
+    CHECK_EQ(problemWith(extra).find(L"outside its folder") != std::wstring::npos, true);   // says which problem
     auto two = fullPackage();
     TestEntry other; other.name = "other/limit-nvpstate.exe"; other.data = "x"; two.push_back(other);
     CHECK_EQ(problemWith(two).empty(), false);                         // two top folders

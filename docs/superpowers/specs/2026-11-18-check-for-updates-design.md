@@ -24,41 +24,18 @@ a release by hand.
 3. Newer → "Version Y is available (you have X)", release-notes link,
    [Update now] [Later]. A renamed exe is not offered Update now.
 4. Update now (Cancel is honoured between every step, and checked again
-   before anything is installed):
-   - work folder: `limit-nvpstate-update\` inside the program folder, marked
-     by `owner.txt`. Not in %TEMP%: nothing a normal program can write to
-     sits between the checksum check and the install, unless the program
-     folder itself is writable to it — and then so is the exe;
-   - download exactly `limit-nvpstate-Y.zip` and `limit-nvpstate-Y.zip.sha256`
-     over HTTPS; refuse unless the SHA-256 matches. A release without a
-     checksum file (5.2.3 and older) gets "open the release page" instead;
-   - unpack with Windows' built-in `tar.exe` (Windows 10 1803+). The package
-     folder is the one folder holding `limit-nvpstate.exe`. Refuse a package
-     with links, unsafe or device names, duplicates, listing errors, too many
-     files or too many bytes, or without the exe, Qt5Core/Gui/Widgets and
-     `platforms\qwindows.dll`;
-   - plan the install (folders to create, files to add, files to replace;
-     never an existing `config.json`; the exe last) and write it to
-     `journal.txt`, flushed, before any program file moves;
-   - replaced files go to `backup\`; any failure undoes the journal. If the
-     undo itself fails, say so and keep the backups — never "nothing was
-     changed" unless it is true. Then write `installed`;
-   - stop detectors and release the GPU; if the release fails, undo and keep
-     running;
-   - start the new exe with `--after-update <process handle> <event handle>`
-     (both inherited; only those two). The new instance initialises, sets the
-     event, waits for the old process, then takes the single-instance mutex
-     and deletes the work folder;
-   - the old instance waits (without blocking) for the event: set → write
-     `confirmed` and exit. The new process exits first, or 30 s pass → stop
-     it, undo, re-apply the limit, keep running.
-5. Exit, logoff or a fatal error while checking/downloading: nothing is
-   installed, even if the download finishes inside an exit warning.
-6. Every start (not one launched by the updater) looks at the work folder:
-   no journal → old download, delete; `confirmed` → delete; `installed` but
-   not confirmed → this is the new version: finish once it's up, undo if it
-   can't start; otherwise an install was interrupted → undo and say so. It
-   never deletes anything outside its own marked folder.
+   before anything is installed): download exactly `limit-nvpstate-Y.zip` and
+   its `.sha256` over HTTPS into `limit-nvpstate-update\` (inside the program
+   folder, not %TEMP%), refuse a checksum mismatch, refuse the zip unless its
+   own file list passes the package rules, unpack with Windows' `tar.exe`,
+   check the result matches that list.
+5. **Installing is the helper's job** — see
+   `2026-11-18-updater-helper-design.md` (supersedes the in-app install of the
+   second review round): the app releases the GPU, starts
+   `limit-nvpstate-updater.exe` and exits; the helper swaps the files while
+   nothing is running, keeps the new version only if it says it is up and is
+   still running 3 s later, and otherwise restores and restarts the previous
+   one. The program shows the outcome and retires the work folder.
 
 ## Version
 

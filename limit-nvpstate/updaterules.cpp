@@ -614,6 +614,12 @@ std::wstring zipProblem(const std::vector<ZipEntry>& entries, std::wstring& topF
         const size_t       slash = name.find(L'\\');
         const std::wstring first = name.substr(0, slash);
 
+        // A file at the top is the more telling problem than "a second top
+        // folder", so it is named first.
+        if (slash == std::wstring::npos && !entry.directory) {
+            return L"The update package has a file outside its folder: " + name;
+        }
+
         if (top.empty()) {
             top = first;
         } else if (lowerAscii(first) != lowerAscii(top)) {
@@ -621,10 +627,6 @@ std::wstring zipProblem(const std::vector<ZipEntry>& entries, std::wstring& topF
         }
 
         if (slash == std::wstring::npos) {
-            if (!entry.directory) {
-                return L"The update package has a file outside its folder: " + name;
-            }
-
             continue;   // the top folder itself
         }
 

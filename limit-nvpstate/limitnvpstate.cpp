@@ -1611,8 +1611,6 @@ void limitnvpstate::finishUpdateLater() {
     runInBackground(this, [appDir, outcome]() {
         using updaterules::Phase;
 
-        updatetxn::deleteTombstones(appDir);
-
         // The helper holds the lock until it has decided -- for the new
         // version, a few seconds after it said it is up.
         for (int waited = 0; updatetxn::updateLockHeld() && waited < 120; waited++) {
@@ -1643,9 +1641,12 @@ void limitnvpstate::finishUpdateLater() {
         // Anything else is an update the helper still has to finish, or one
         // that needs repair: left exactly as it is.
     }, [this, outcome, appDir]() {
-        // The tombstone can wait out a locked file in the background; the
-        // outcome is shown now.
-        runInBackground(this, [appDir]() { updatetxn::deleteTombstones(appDir); }, [this]() { updateBusy = false; });
+        updateBusy = false;
+
+        // Tombstones (this one, and any a crash left) may have to wait out a
+        // locked file. They have names no new update uses, so this needn't
+        // hold up "Check for Updates".
+        runInBackground(this, [appDir]() { updatetxn::deleteTombstones(appDir); }, []() {});
 
         if (exiting) {
             return;
@@ -1666,6 +1667,8 @@ void limitnvpstate::finishUpdateLater() {
 
 void limitnvpstate::signalReadyLater(HANDLE event) {
     QTimer::singleShot(500, this, [event]() {
+        testPause(L"LIMITNV_TEST_PAUSE_BEFORE_READY");
+
         if (!fatalReported && !exiting && !SetEvent(event)) {
             LOG(L"error: could not tell the updater we are up (%lu)\n", GetLastError());
         }

@@ -317,11 +317,17 @@ int install(const std::wstring& appDir, HANDLE oldApp, bool show) {
             CloseHandle(child);
 
             if (gone != WAIT_OBJECT_0) {
+                // Nothing is restored and nothing started while it may still
+                // run. Nobody else will tell the user, so this does.
+                const std::wstring text = reason + L"\n\nThe new version could not be stopped, so the update could not "
+                                                   L"be undone yet. Restart Windows, then start limit-nvpstate: it "
+                                                   L"finishes undoing the update. If it doesn't start, run "
+                                                   L"limit-nvpstate-updater.exe in its folder.";
                 CloseHandle(ready);
-                updatetxn::writeResult(appDir, reason + L"\n\nThe new version could not be stopped. Restart Windows; "
-                                                        L"limit-nvpstate will then finish undoing the update.");
-                updatetxn::releaseUpdateLock(lock);
-                return 2;   // phase stays "verifying": the next start recovers
+                updatetxn::writeResult(appDir, text);
+                updatetxn::releaseUpdateLock(lock);   // phase stays "verifying": the next start recovers
+                MessageBoxW(nullptr, text.c_str(), L"limit-nvpstate updater", MB_ICONWARNING | MB_OK);
+                return 2;
             }
         }
 
