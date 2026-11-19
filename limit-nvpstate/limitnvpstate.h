@@ -41,6 +41,7 @@ public:
     // was rolled back -- and retire the updater's work folder. Also deletes
     // tombstones a crash left behind.
     void finishUpdateLater();
+    void setSettingsLocked(bool locked);
 
     // Started by the helper (--after-update): from inside the running event
     // loop, half a second after init(), tell it we are up -- unless a fatal
@@ -67,7 +68,7 @@ private:
 
     // The hand-over did not happen: resume watching (unless exiting), delete
     // the download, say why.
-    void resumeAfterFailedHandOff(const QString& reason);
+    void resumeAfterFailedHandOff(const QString& reason, bool helperMayRun = false);
 
     bool fail(const char* message);
     void createTrayIcon();

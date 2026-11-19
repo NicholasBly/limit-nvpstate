@@ -1597,6 +1597,11 @@ void limitnvpstate::shutdown(int exitCode) {
     QCoreApplication::exit(exitCode);
 }
 
+void limitnvpstate::setSettingsLocked(bool locked) {
+    ui.centralWidget->setEnabled(!locked);
+    ui.menuBar->setEnabled(!locked);
+}
+
 void limitnvpstate::finishUpdateLater() {
     struct Outcome {
         bool    updated = false;
@@ -1613,7 +1618,9 @@ void limitnvpstate::finishUpdateLater() {
 
         // The helper holds the lock until it has decided -- for the new
         // version, a few seconds after it said it is up.
-        for (int waited = 0; updatetxn::updateLockHeld() && waited < 120; waited++) {
+        // Up to 2 minutes: the helper holds the lock while it checks this
+        // version (up to 30 s to say it's up, 3 s more, the commit).
+        for (int waited = 0; updatetxn::updateLockHeld() && waited < 480; waited++) {
             Sleep(250);
         }
 
@@ -1646,6 +1653,7 @@ void limitnvpstate::finishUpdateLater() {
         // that needs repair: left exactly as it is.
     }, [this, outcome, appDir]() {
         updateBusy = false;
+        setSettingsLocked(false);   // the helper is done with this version
 
         // Tombstones (this one, and any a crash left) may have to wait out a
         // locked file. They have names no new update uses, so this needn't
@@ -1749,7 +1757,9 @@ void limitnvpstate::checkForUpdates() {
         box.setTextFormat(Qt::PlainText);
         box.setText(QStringLiteral("Version %1 is available (you have %2).\n\n"
                                    "Release notes: %3\n\n"
-                                   "Updating restarts limit-nvpstate. Your settings are kept.")
+                                   "Updating restarts limit-nvpstate. Your settings are kept.\n\n"
+                                   "Updates are checked for damage but are not signed: install only if you trust "
+                                   "this project's GitHub releases.")
                         .arg(latest, current, notes));
         box.setTextInteractionFlags(Qt::TextSelectableByMouse);
 
@@ -1846,19 +1856,22 @@ void limitnvpstate::startUpdate(const updater::Release& release) {
         // has taken over -- waited for in the background (up to 45 s if
         // another update holds the lock). If it hasn't, this copy carries on.
         struct HandOff {
-            bool         ok = false;
-            std::wstring error;
+            updater::HandOff result = updater::HandOff::Refused;
+            std::wstring     error;
         };
 
         const auto handOff = std::make_shared<HandOff>();
         const bool visible = isVisible();
 
         runInBackground(this, [appDir, visible, handOff]() {
-            handOff->ok = updater::launchHelper(appDir, visible, handOff->error);
+            handOff->result = updater::launchHelper(appDir, visible, handOff->error);
         }, [this, handOff]() {
-            if (!handOff->ok) {
+            if (handOff->result != updater::HandOff::Accepted) {
+                // Unresolved: the helper may still be there. Its folder is
+                // kept and no other update starts in this session.
                 resumeAfterFailedHandOff(QStringLiteral("The update was not installed.\n\n%1")
-                                             .arg(QString::fromStdWString(handOff->error)));
+                                             .arg(QString::fromStdWString(handOff->error)),
+                                         handOff->result == updater::HandOff::Unresolved);
                 return;
             }
 
@@ -1873,7 +1886,7 @@ void limitnvpstate::startUpdate(const updater::Release& release) {
     });
 }
 
-void limitnvpstate::resumeAfterFailedHandOff(const QString& reason) {
+void limitnvpstate::resumeAfterFailedHandOff(const QString& reason, bool helperMayRun) {
     if (!exiting) {
         {
             StateGuard guard;
@@ -1883,8 +1896,13 @@ void limitnvpstate::resumeAfterFailedHandOff(const QString& reason) {
         updateDetectors();   // the cache says "released", so the limit is sent again
     }
 
-    const std::wstring appDir = getProgramDirectory();
-    runInBackground(this, [appDir]() { updater::discardDownload(appDir); }, [this]() { updateBusy = false; });
+    // A helper that may still run keeps its folder, and updateBusy stays set:
+    // no other update in this session.
+    if (!helperMayRun) {
+        const std::wstring appDir = getProgramDirectory();
+        runInBackground(this, [appDir]() { updater::discardDownload(appDir); }, [this]() { updateBusy = false; });
+    }
+
     showPlain(this, QMessageBox::Warning, reason);
 }
 

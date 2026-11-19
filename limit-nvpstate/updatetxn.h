@@ -135,6 +135,9 @@ SwapResult swapIn(const std::wstring& packageDir, const std::wstring& appDir, st
 // "rolled-back" or "needs-repair".
 bool undo(const std::wstring& appDir, std::wstring& error);
 
+// True if `path` is the exe of this very process.
+bool isRunningImage(const std::wstring& path);
+
 // ---- cleanup (the app) ------------------------------------------------------
 
 // Renames the work folder to a unique tombstone (one atomic step; then

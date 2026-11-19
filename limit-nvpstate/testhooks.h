@@ -36,8 +36,22 @@ inline bool testFails(const wchar_t* variable, const std::wstring& what) {
     return n > 0 && n < 512 && (what == value || std::wstring(value) == L"*");
 }
 
+// The variable's text, if it is set.
+inline bool testText(const wchar_t* variable, std::wstring& out) {
+    wchar_t     value[512];
+    const DWORD n = GetEnvironmentVariableW(variable, value, 512);
+
+    if (n == 0 || n >= 512) {
+        return false;
+    }
+
+    out.assign(value, n);
+    return true;
+}
+
 #else
 
+inline bool     testText(const wchar_t*, std::wstring&) { return false; }
 inline void     testPause(const wchar_t*) {}
 inline unsigned testValue(const wchar_t*, unsigned normal) { return normal; }
 inline bool     testFails(const wchar_t*, const std::wstring&) { return false; }

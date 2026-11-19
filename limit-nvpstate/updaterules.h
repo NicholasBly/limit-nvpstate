@@ -66,7 +66,20 @@ std::wstring formatJournal(const std::vector<JournalEntry>& entries);
 // (an older format included), unknown kind, unsafe or reserved path, cut off
 // mid-line, not exactly one P (first, under download\\unpacked), a path
 // twice, or config.json as a replaced file.
+// The longest journal text read back: 1M characters (2 MiB on disk), inside
+// what the reader of the file accepts (4 MiB).
+constexpr size_t MAX_JOURNAL_CHARS = 1u << 20;
+
 bool parseJournal(const std::wstring& text, std::vector<JournalEntry>& out);
+
+// Why this plan must not be written, or empty if it may: the swap writes
+// only what recovery can read back -- the text goes through parseJournal()
+// and must come back exactly the same.
+std::wstring journalProblem(const std::vector<JournalEntry>& plan);
+
+// True if `url` is exactly `prefix` followed by `name`: the release's own
+// download address for that asset, nothing added.
+bool isExpectedAssetUrl(const std::string& url, const std::string& prefix, const std::string& name);
 
 // Why an unpacked package must not be installed, or empty if it may: the
 // files every release has (the exe, the updater helper, Qt5Core/Gui/Widgets,

@@ -342,7 +342,7 @@ bool parseJournal(const std::wstring& text, std::vector<JournalEntry>& out) {
 
     const std::wstring header = std::wstring(JOURNAL_HEADER) + L"\n";
 
-    if (text.compare(0, header.size(), header) != 0) {
+    if (text.size() > MAX_JOURNAL_CHARS || text.compare(0, header.size(), header) != 0) {
         return false;
     }
 
@@ -427,6 +427,26 @@ bool parseJournal(const std::wstring& text, std::vector<JournalEntry>& out) {
     }
 
     return true;
+}
+
+std::wstring journalProblem(const std::vector<JournalEntry>& plan) {
+    std::vector<JournalEntry> back;
+
+    if (!parseJournal(formatJournal(plan), back) || back.size() != plan.size()) {
+        return L"The update needs more changes than the updater can safely record, so it was not installed";
+    }
+
+    for (size_t k = 0; k < plan.size(); k++) {
+        if (back[k].kind != plan[k].kind || back[k].path != plan[k].path) {
+            return L"The update needs more changes than the updater can safely record, so it was not installed";
+        }
+    }
+
+    return {};
+}
+
+bool isExpectedAssetUrl(const std::string& url, const std::string& prefix, const std::string& name) {
+    return !prefix.empty() && !name.empty() && url == prefix + name;
 }
 
 bool isReservedPath(const std::wstring& path) {
@@ -593,7 +613,9 @@ bool parseZipDirectory(const std::string& directory, unsigned count, std::vector
         at += HEADER + nameLength + extra + comment;
     }
 
-    return true;
+    // Every byte belongs to a listed entry: anything left over is a record
+    // the count doesn't mention, or something that isn't a record at all.
+    return at == directory.size();
 }
 
 std::wstring zipProblem(const std::vector<ZipEntry>& entries, std::wstring& topFolder) {

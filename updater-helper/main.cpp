@@ -45,12 +45,25 @@ constexpr DWORD APP_GONE_MS  = 10000;   // no other copy may be running
 constexpr int   COMMIT_TRIES    = 5;     // writing "committed"...
 constexpr DWORD COMMIT_RETRY_MS = 200;   // ...this far apart
 
-// Exit codes. The program reads the ones from before the helper took over.
-constexpr int EXIT_OK          = 0;
-constexpr int EXIT_REFUSED     = 1;
+// The command line and these exit codes are a contract with every earlier
+// version of the program, because an update is installed by the NEW
+// package's helper on behalf of the OLD program (docs: "Compatibility"):
+//
+//   install <process> [<accepted event>] [--show]
+//   recover [<process> [<accepted event>]] [--show]
+//
+// Without the event (5.3.0 development builds before the hand-off check)
+// the old program has closed already; the helper just goes ahead. A future
+// helper that can't serve an old program exits with EXIT_UNSUPPORTED before
+// it sets "accepted", and that program keeps running and says so.
+constexpr int EXIT_OK           = 0;
+constexpr int EXIT_REFUSED      = 1;
 constexpr int EXIT_NEEDS_REPAIR = 2;
-constexpr int EXIT_BUSY        = 3;   // another update holds the lock
-constexpr int EXIT_NO_PACKAGE  = 4;   // the reason is in result.txt
+constexpr int EXIT_BUSY         = 3;   // another update holds the lock
+constexpr int EXIT_NO_PACKAGE   = 4;   // the reason is in result.txt
+constexpr int EXIT_UNSUPPORTED  = 5;   // reserved: this helper can't install for that program
+
+constexpr DWORD OTHER_COPY_GONE_MS = 30000;   // after refusing: wait for that copy, then start again
 
 struct Options {
     enum class Mode { Install, Recover, Invalid } mode = Mode::Invalid;
@@ -122,7 +135,7 @@ Options parseOptions() {
 
     LocalFree(args);
 
-    if (options.mode == Options::Mode::Install && (!options.waitFor || !options.accepted)) {
+    if (options.mode == Options::Mode::Install && !options.waitFor) {
         options.mode = Options::Mode::Invalid;   // install always comes from the app
     }
 
@@ -294,13 +307,20 @@ bool waitForNoApp(DWORD ms) {
     }
 }
 
-// From here on this helper owns the update; the program may close.
-void acknowledge(HANDLE& accepted) {
-    if (accepted) {
-        SetEvent(accepted);
-        CloseHandle(accepted);
-        accepted = nullptr;
+// From here on this helper owns the update; the program may close. False if
+// the program could not be told: then this helper must not go on -- the
+// program is still running and will carry on when this process ends.
+bool acknowledge(HANDLE& accepted) {
+    if (!accepted) {
+        return true;   // the old one-handle form: that program has closed already
     }
+
+    testPause(L"LIMITNV_TEST_PAUSE_BEFORE_ACCEPT");
+
+    const bool told = !testFails(L"LIMITNV_TEST_FAIL_ACCEPT_SIGNAL", L"1") && SetEvent(accepted) != FALSE;
+    CloseHandle(accepted);
+    accepted = nullptr;
+    return told;
 }
 
 void closeIfSet(HANDLE& handle) {
@@ -338,7 +358,17 @@ int install(const std::wstring& appDir, HANDLE oldApp, HANDLE accepted, bool sho
         return EXIT_NO_PACKAGE;
     }
 
-    acknowledge(accepted);
+    if (!acknowledge(accepted)) {
+        updatetxn::releaseUpdateLock(lock);
+        CloseHandle(oldApp);
+        return EXIT_REFUSED;
+    }
+
+    if (testFails(L"LIMITNV_TEST_HELPER_EXIT_AFTER_ACCEPT", L"1")) {
+        updatetxn::releaseUpdateLock(lock);
+        CloseHandle(oldApp);
+        return EXIT_REFUSED;   // test only: dies right after answering
+    }
 
     // Nothing is touched until the old version is really gone: its exe and
     // DLLs are in use until then.
@@ -363,13 +393,23 @@ int install(const std::wstring& appDir, HANDLE oldApp, HANDLE accepted, bool sho
 
     // No other copy may be running while the files change: it would hold
     // them open, or run on a mix of old and new files.
+    testPause(L"LIMITNV_TEST_PAUSE_BEFORE_APP_CHECK");   // test only
+
     if (!waitForNoApp(APP_GONE_MS)) {
         std::wstring phaseError;
         updatetxn::writeResult(appDir, L"Another copy of limit-nvpstate was running, so the update was not "
                                        L"installed. Nothing was changed.");
         updatetxn::writePhase(appDir, Phase::RolledBack, phaseError);
         updatetxn::releaseUpdateLock(lock);
-        return EXIT_REFUSED;   // that copy is the GPU manager; nothing to start
+
+        // That copy may be the GPU manager now -- or one that saw the lock
+        // and is closing, slowly. Once it's gone, the program is started
+        // again, so something is always running.
+        if (waitForNoApp(OTHER_COPY_GONE_MS)) {
+            restartApp(appDir, show);
+        }
+
+        return EXIT_REFUSED;
     }
 
     const updatetxn::SwapResult swapped = updatetxn::swapIn(packageDir, appDir, error);
@@ -395,6 +435,15 @@ int install(const std::wstring& appDir, HANDLE oldApp, HANDLE accepted, bool sho
     // ---- start the new version and check it is healthy
     int          result = 0;
     std::wstring reason;
+
+    // Test only: a backup, or the saved settings, lost after the swap.
+    if (testFails(L"LIMITNV_TEST_LOSE_SAVED_CONFIG", L"1")) {
+        DeleteFileW(updatetxn::workFile(appDir, L"config-before-update.json").c_str());
+    }
+
+    if (std::wstring lost; testText(L"LIMITNV_TEST_LOSE_BACKUP", lost)) {
+        DeleteFileW((updatetxn::backupDir(appDir) + L"\\" + lost).c_str());
+    }
 
     if (!updatetxn::writePhase(appDir, Phase::Verifying, error)) {
         reason = error;
@@ -539,7 +588,11 @@ int recover(const std::wstring& appDir, HANDLE waitFor, HANDLE accepted, bool sh
         return EXIT_BUSY;
     }
 
-    acknowledge(accepted);
+    if (!acknowledge(accepted)) {
+        updatetxn::releaseUpdateLock(lock);
+        closeIfSet(waitFor);
+        return EXIT_REFUSED;
+    }
 
     if (waitFor) {
         const DWORD closed = WaitForSingleObject(waitFor, OLD_EXIT_MS);
@@ -606,6 +659,28 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
         }
 
         return EXIT_REFUSED;   // the program, if it started this, sees no "accepted" and says so
+    }
+
+    // Run by hand from the program folder, this exe may have to put itself
+    // back -- possible only by moving itself aside first, with a moment in
+    // between where it is missing. The copy in the work folder can do it in
+    // one step, so the job goes to that copy when there is one.
+    const std::wstring staged = updatetxn::helperPath(appDir);
+
+    if (options.mode == Options::Mode::Recover && !options.waitFor && updatetxn::fileExists(staged)
+        && !updatetxn::isRunningImage(staged)) {
+        std::wstring        command = L"\"" + staged + L"\" recover" + (options.show ? L" --show" : L"");
+        STARTUPINFOW        startup = {};
+        PROCESS_INFORMATION process = {};
+        startup.cb                  = sizeof(startup);
+
+        if (CreateProcessW(staged.c_str(), command.data(), nullptr, nullptr, FALSE, 0, nullptr, appDir.c_str(), &startup,
+                           &process)) {
+            CloseHandle(process.hThread);
+            CloseHandle(process.hProcess);
+            return EXIT_OK;
+        }
+        // It can't be started: this exe does the job itself.
     }
 
     return options.mode == Options::Mode::Install ? install(appDir, options.waitFor, options.accepted, options.show)

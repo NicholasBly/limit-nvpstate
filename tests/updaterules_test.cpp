@@ -449,6 +449,56 @@ void journal_pathRules() {
              true);
 }
 
+// Review 5, V1: the swap checks its plan with recovery's own reader before
+// it writes anything -- whatever the writer can produce, recovery can read.
+void journal_writerChecksWhatRecoveryReads() {
+    const JournalEntry        pkg  = { L'P', L"download\\unpacked\\limit-nvpstate" };
+    std::vector<JournalEntry> plan = { pkg };
+    for (int k = 0; k < 4095; k++) {
+        plan.push_back({ L'A', L"f" + std::to_wstring(k) + L".dll" });
+    }
+    CHECK_EQ(journalProblem(plan).empty(), true);    // 4,096 lines: the most recovery reads
+    plan.push_back({ L'A', L"one-more.dll" });
+    CHECK_EQ(journalProblem(plan).empty(), false);   // 4,097
+    CHECK_EQ(journalProblem({ pkg, { L'A', L"plugins\\a.dll" }, { L'D', L"plugins" } }).empty(), false);
+    CHECK_EQ(journalProblem({ pkg, { L'D', L"plugins" }, { L'A', L"plugins\\a.dll" } }).empty(), true);
+    CHECK_EQ(journalProblem({ pkg, { L'A', L"a/b.dll" } }).empty(), false);
+
+    // Under 4,096 lines but over the size recovery reads (MAX_JOURNAL_CHARS).
+    std::vector<JournalEntry> wide = { pkg };
+    const std::wstring        part(100, L'a');
+    for (int k = 0; k < 4000; k++) {
+        wide.push_back({ L'A', part + L"\\" + part + L"\\" + part + std::to_wstring(k) });
+    }
+    CHECK_EQ(journalProblem(wide).empty(), false);
+}
+
+// Review 5, V9: every byte of the central directory belongs to a listed entry.
+void zip_directoryIsUsedUp() {
+    const std::string  zip      = makeZip(fullPackage());
+    const size_t       tailSize = zip.size() < 65557 ? zip.size() : 65557;
+    unsigned long long offset = 0, size = 0;
+    unsigned           count  = 0;
+    CHECK_EQ(findZipDirectory(zip.substr(zip.size() - tailSize), zip.size(), offset, size, count), true);
+    const std::string     directory = zip.substr(static_cast<size_t>(offset), static_cast<size_t>(size));
+    std::vector<ZipEntry> out;
+    CHECK_EQ(parseZipDirectory(directory, count, out), true);
+    CHECK_EQ(parseZipDirectory(directory + "PK\x01\x02junk", count, out), false);   // bytes left over
+    CHECK_EQ(parseZipDirectory(directory, count - 1, out), false);                  // a record past the count
+}
+
+// Review 5, V9: the zip and its checksum come from exactly the release's own
+// download address.
+void assetUrl_isTheReleaseDownload() {
+    const std::string prefix = "https://github.com/NicholasBly/limit-nvpstate/releases/download/5.3.0/";
+    const std::string name   = "limit-nvpstate-5.3.0.zip";
+    CHECK_EQ(isExpectedAssetUrl(prefix + name, prefix, name), true);
+    CHECK_EQ(isExpectedAssetUrl("https://elsewhere.example/" + name, prefix, name), false);
+    CHECK_EQ(isExpectedAssetUrl(prefix + "../../../other/" + name, prefix, name), false);
+    CHECK_EQ(isExpectedAssetUrl(prefix + name + "?x=1", prefix, name), false);
+    CHECK_EQ(isExpectedAssetUrl(prefix + "other.zip", prefix, name), false);
+}
+
 } // namespace
 
 int main() {
@@ -474,6 +524,9 @@ int main() {
     phase_roundTrip();
     journal_v2_schema();
     journal_pathRules();
+    journal_writerChecksWhatRecoveryReads();
+    zip_directoryIsUsedUp();
+    assetUrl_isTheReleaseDownload();
 
     if (failures == 0) {
         std::printf("all tests passed\n");

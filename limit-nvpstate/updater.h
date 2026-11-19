@@ -51,9 +51,15 @@ bool prepare(const Release&      release,
 // Deletes a download that will not be installed (cancel, error, exit).
 void discardDownload(const std::wstring& appDir);
 
-// Starts the helper ("install <this process> [--show]"). The caller then
-// exits; the helper waits for that.
-bool launchHelper(const std::wstring& appDir, bool show, std::wstring& error);
+// Starts the helper ("install <this process> <accepted event> [--show]") and
+// waits until it has taken over (it then waits for this process to close).
+// How a hand-over to the helper went. Accepted: it has taken over, this
+// program may close. Refused: it ended without changing anything (`error`
+// says why). Unresolved: it didn't answer and couldn't be confirmed stopped
+// -- keep running, keep its folder, and don't start another update.
+enum class HandOff { Accepted, Refused, Unresolved };
+
+HandOff launchHelper(const std::wstring& appDir, bool show, std::wstring& error);
 
 enum class StartupState {
     Normal,        // nothing pending (finishUpdateLater may still have news)

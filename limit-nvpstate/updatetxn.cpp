@@ -21,6 +21,8 @@ const wchar_t UPDATE_LOCK[]   = L"Local\\limit-nvpstate-update";
 const wchar_t HELPER_NAME[]   = L"limit-nvpstate-updater.exe";
 const wchar_t COPYING_DIR[]   = L"copying";   // backups being copied (never read by undo)
 const wchar_t SAVED_CONFIG[]  = L"config-before-update.json";
+const wchar_t CONFIG_ABSENT[] = L"config-absent.txt";   // there was no config.json before the update
+const wchar_t RESTORING_DIR[] = L"restoring";           // old files on their way back (never read by undo)
 const int     RETIRE_TRIES    = 20;    // renaming the work folder...
 const DWORD   RETIRE_RETRY_MS = 250;   // ...this far apart: about 5 s
 
@@ -284,6 +286,20 @@ bool isOwnImage(const std::wstring& path) {
     return n > 0 && n < MAX_PATH && fileIdentity(own, x) && fileIdentity(path, y) && sameIdentity(x, y);
 }
 
+// Every folder between `base` and the file `relative` is a plain folder (or
+// not there): never a link, a file, or something that can't be examined.
+bool plainFolders(const std::wstring& base, const std::wstring& relative) {
+    for (size_t slash = relative.find(L'\\'); slash != std::wstring::npos; slash = relative.find(L'\\', slash + 1)) {
+        const PathState state = probe(base + L"\\" + relative.substr(0, slash));
+
+        if (state != PathState::Directory && state != PathState::Missing) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 bool isUnder(const std::wstring& path, const std::wstring& folder) {
     return path.size() > folder.size() + 1 && path[folder.size()] == L'\\'
         && CompareStringOrdinal(path.c_str(), static_cast<int>(folder.size()), folder.c_str(),
@@ -380,6 +396,7 @@ bool readTextFile(const std::wstring& path, std::wstring& text) {
     }
 
     LARGE_INTEGER size = {};
+    static_assert((updaterules::MAX_JOURNAL_CHARS + 1) * sizeof(wchar_t) <= (4 << 20), "a journal must fit what is read");
     bool          ok   = GetFileSizeEx(file, &size) && size.QuadPart >= 2 && size.QuadPart <= (4 << 20)
              && size.QuadPart % 2 == 0;
 
@@ -538,6 +555,44 @@ bool hasJournal(const std::wstring& appDir) {
     return probe(workFile(appDir, JOURNAL_FILE)) != PathState::Missing;
 }
 
+namespace {
+
+// A folder left by a crash while it was being set up: ours (it has the
+// marker) becomes a tombstone, deleted later in the background; an empty one
+// is removed; anything else is left alone.
+void retireLeftoverBuilds(const std::wstring& appDir) {
+    WIN32_FIND_DATAW data;
+    HANDLE           find = FindFirstFileW((appDir + L"\\" + BUILDING + L"*").c_str(), &data);
+
+    if (find == INVALID_HANDLE_VALUE) {
+        return;
+    }
+
+    std::vector<std::wstring> leftovers;
+
+    do {
+        if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && !(data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
+            leftovers.push_back(appDir + L"\\" + data.cFileName);
+        }
+    } while (FindNextFileW(find, &data));
+
+    FindClose(find);
+
+    for (size_t k = 0; k < leftovers.size(); k++) {
+        const std::wstring& dir = leftovers[k];
+
+        if (fileExists(dir + L"\\" + OWNER_FILE)) {
+            const std::wstring tombstone = appDir + L"\\" + TOMBSTONE + std::to_wstring(GetTickCount64()) + L"-"
+                                         + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(k);
+            MoveFileExW(dir.c_str(), tombstone.c_str(), 0);
+        } else {
+            RemoveDirectoryW(dir.c_str());   // only if empty
+        }
+    }
+}
+
+} // namespace
+
 bool openWorkDir(const std::wstring& appDir, std::wstring& error) {
     const std::wstring dir = workDir(appDir);
 
@@ -577,21 +632,48 @@ bool openWorkDir(const std::wstring& appDir, std::wstring& error) {
     // its real name the folder always has its marker, so a failure halfway
     // can't leave a folder that blocks every later update. Inherits the
     // program folder's permissions: no easier to change than the exe next to it.
-    const std::wstring building = appDir + L"\\" + BUILDING + std::to_wstring(GetTickCount64()) + L"-"
-                                + std::to_wstring(GetCurrentProcessId());
-    const auto         failed   = [&](const wchar_t* what) {
+    //
+    // Leftovers of an earlier set-up (a crash) are cleared first. Only this
+    // function uses these names, and only one update runs at a time, so the
+    // background clean-up of old work folders never touches them: a folder
+    // being set up right now is never anybody's leftover.
+    retireLeftoverBuilds(appDir);
+
+    std::wstring stem = std::to_wstring(GetTickCount64()) + L"-" + std::to_wstring(GetCurrentProcessId());
+
+    if (std::wstring name; testText(L"LIMITNV_TEST_BUILDING_NAME", name)) {
+        stem = name;   // test only: a fixed name, to make it clash
+    }
+
+    // A name that is taken belongs to someone else: another name is tried,
+    // and the taken folder is never touched.
+    std::wstring building;
+    bool         created = false;
+
+    for (int attempt = 0; attempt < 10 && !created; attempt++) {
+        building = appDir + L"\\" + BUILDING + stem + (attempt ? L"-" + std::to_wstring(attempt) : std::wstring());
+        created  = CreateDirectoryW(building.c_str(), nullptr) != FALSE;
+
+        if (!created && GetLastError() != ERROR_ALREADY_EXISTS) {
+            break;
+        }
+    }
+
+    if (!created) {
+        error = errorText(L"Could not create the updater's folder", GetLastError());
+        return false;
+    }
+
+    const auto failed = [&](const wchar_t* what) {
         const DWORD code = GetLastError();
-        removeTree(building);
+        removeTree(building);   // made by this call, just now
         error = errorText(what, code);
         return false;
     };
 
-    if (!CreateDirectoryW(building.c_str(), nullptr)) {
-        return failed(L"Could not create the updater's folder");
-    }
-
     if (probe(building) != PathState::Directory || testFailsTimes(L"LIMITNV_TEST_FAIL_OWNER_TIMES")
         || !writeTextFile(building + L"\\" + OWNER_FILE, L"limit-nvpstate updater\n", CREATE_NEW)
+        || (testPause(L"LIMITNV_TEST_PAUSE_WORKDIR_SETUP"), false)
         || !CreateDirectoryW((building + downloadDir(appDir).substr(dir.size())).c_str(), nullptr)
         || !MoveFileExW(building.c_str(), dir.c_str(), 0)) {
         return failed(L"Could not set up the updater's folder");
@@ -835,6 +917,13 @@ SwapResult swapIn(const std::wstring& packageDir, const std::wstring& appDir, st
         }
     }
 
+    // ---- only a plan recovery can read back is ever acted on
+    error = updaterules::journalProblem(plan);
+
+    if (!error.empty()) {
+        return SwapResult::RolledBack;
+    }
+
     // ---- the new files' data reaches the disk before any rename points at it
     for (const JournalEntry& step : plan) {
         if (step.kind != L'A' && step.kind != L'R') {
@@ -857,13 +946,25 @@ SwapResult swapIn(const std::wstring& packageDir, const std::wstring& appDir, st
 
     // ---- your settings as they are now: the new version may change them
     // while it is being checked, and an undo puts them back with the files.
+    // There may be none (then that is recorded); a settings file that can't
+    // be examined stops the update -- it is never taken as "none".
     const std::wstring config      = appDir + L"\\config.json";
     const std::wstring savedConfig = workFile(appDir, SAVED_CONFIG);
+    const PathState    configState = testFails(L"LIMITNV_TEST_CONFIG_UNREADABLE", L"1") ? PathState::Error : probe(config);
 
-    if (probe(config) == PathState::File
-        && (!CopyFileW(config.c_str(), savedConfig.c_str(), TRUE) || !flushToDisk(savedConfig))) {
-        error = errorText(L"Could not save a copy of your settings", GetLastError());
-        DeleteFileW(savedConfig.c_str());
+    if (configState == PathState::File) {
+        if (!CopyFileW(config.c_str(), savedConfig.c_str(), TRUE) || !flushToDisk(savedConfig)) {
+            error = errorText(L"Could not save a copy of your settings", GetLastError());
+            DeleteFileW(savedConfig.c_str());
+            return SwapResult::RolledBack;
+        }
+    } else if (configState == PathState::Missing) {
+        if (!writeTextFile(workFile(appDir, CONFIG_ABSENT), L"there was no config.json before the update\n", CREATE_NEW)) {
+            error = errorText(L"Could not record your settings", GetLastError());
+            return SwapResult::RolledBack;
+        }
+    } else {
+        error = L"Your settings file (config.json) is not a normal file or can't be read, so the update was not installed";
         return SwapResult::RolledBack;
     }
 
@@ -959,6 +1060,61 @@ SwapResult swapIn(const std::wstring& packageDir, const std::wstring& appDir, st
     return SwapResult::Swapped;
 }
 
+namespace {
+
+// Puts `from` (a backup, or the saved settings) at `target` in one rename,
+// and keeps `from`: a hard link to it (or a flushed copy) is made in
+// restoring\ first and renamed over the target. A repeated undo then finds the
+// target already the same file and does nothing. `now`: what is at target.
+bool restoreFile(const std::wstring& appDir, const std::wstring& from, const std::wstring& target,
+                 const std::wstring& relative, PathState now) {
+    const std::wstring dir    = workDir(appDir) + L"\\" + RESTORING_DIR;
+    const std::wstring staged = dir + L"\\" + relative;
+
+    if ((!directoryExists(dir) && !CreateDirectoryW(dir.c_str(), nullptr)) || !makeDirectories(dir, relative)) {
+        return false;
+    }
+
+    DeleteFileW(staged.c_str());
+
+    if (!CreateHardLinkW(staged.c_str(), from.c_str(), nullptr)
+        && (!CopyFileW(from.c_str(), staged.c_str(), TRUE) || !flushToDisk(staged))) {
+        return false;
+    }
+
+    if (!testFails(L"LIMITNV_TEST_FAIL_RESTORE_REPLACE", relative)
+        && MoveFileExW(staged.c_str(), target.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        return true;
+    }
+
+    // A running exe can be renamed but not replaced, and the only program
+    // file running now can be this helper (run by hand from the program
+    // folder). Only that one is moved aside first; anything else stays as it
+    // is and is tried again later -- moving it aside could leave no file at
+    // all if this stopped halfway.
+    const std::wstring trash = now == PathState::File && isOwnImage(target) ? freeTrashName(appDir) : std::wstring();
+
+    if (trash.empty() || !MoveFileExW(target.c_str(), trash.c_str(), MOVEFILE_WRITE_THROUGH)) {
+        DeleteFileW(staged.c_str());
+        return false;
+    }
+
+    testPause(L"LIMITNV_TEST_PAUSE_RESTORE_ASIDE");
+
+    if (!MoveFileExW(staged.c_str(), target.c_str(), MOVEFILE_WRITE_THROUGH)) {
+        MoveFileExW(trash.c_str(), target.c_str(), MOVEFILE_WRITE_THROUGH);   // as it was
+        return false;
+    }
+
+    return true;
+}
+
+} // namespace
+
+bool isRunningImage(const std::wstring& path) {
+    return isOwnImage(path);
+}
+
 bool undo(const std::wstring& appDir, std::wstring& error) {
     std::wstring                           text;
     std::vector<updaterules::JournalEntry> plan;
@@ -974,14 +1130,32 @@ bool undo(const std::wstring& appDir, std::wstring& error) {
         return false;
     }
 
-    const std::wstring packageDir = workDir(appDir) + L"\\" + plan[0].path;
+    const std::wstring work       = workDir(appDir);
+    const std::wstring packageDir = work + L"\\" + plan[0].path;
+    const std::wstring backups    = backupDir(appDir);
     std::wstring       failed;
+
+    // Never through a link: the work folder, the package and backup folders,
+    // and every folder on the way to each file must be plain folders, or an
+    // undo could act on files somewhere else entirely.
+    if (probe(work) != PathState::Directory || !plainFolders(work, plan[0].path + L"\\x")
+        || (probe(packageDir) != PathState::Directory && probe(packageDir) != PathState::Missing)
+        || (probe(backups) != PathState::Directory && probe(backups) != PathState::Missing)) {
+        error = L"The updater's folder is not as the update left it (a link, or it can't be examined). The previous "
+                L"versions are kept in " + backups;
+        return false;
+    }
 
     // Each step checks what actually happened, so it is right whether the
     // swap got that far or not. A file that can't be examined is a failure,
     // never taken as missing.
     for (auto it = plan.rbegin(); it != plan.rend(); ++it) {
         const std::wstring target = appDir + L"\\" + it->path;
+
+        if (!plainFolders(appDir, it->path) || !plainFolders(packageDir, it->path) || !plainFolders(backups, it->path)) {
+            failed += L"\n" + it->path;
+            continue;
+        }
 
         if (it->kind == L'A') {
             const PathState source = probe(packageDir + L"\\" + it->path);
@@ -997,11 +1171,18 @@ bool undo(const std::wstring& appDir, std::wstring& error) {
                 failed += L"\n" + it->path;
             }
         } else if (it->kind == L'R') {
-            const std::wstring backup = backupDir(appDir) + L"\\" + it->path;
+            const std::wstring backup = backups + L"\\" + it->path;
             const PathState    saved  = probe(backup);
 
             if (saved == PathState::Missing) {
-                continue;   // never backed up, so never replaced
+                // Still in the package: never moved in, so never replaced.
+                // Moved in, and its backup gone: it can't be put back -- that
+                // is never taken as "nothing to do".
+                if (probe(packageDir + L"\\" + it->path) != PathState::File) {
+                    failed += L"\n" + it->path;
+                }
+
+                continue;
             }
 
             if (saved != PathState::File || testFails(L"LIMITNV_TEST_FAIL_RESTORE", it->path)) {
@@ -1013,9 +1194,9 @@ bool undo(const std::wstring& appDir, std::wstring& error) {
 
             if (now == PathState::File) {
                 // Backed up but never replaced (the swap stopped between the
-                // two): the target is still the previous file -- the very
-                // same one, for a hard-link backup. Nothing to put back. If
-                // that can't be told, nothing is overwritten.
+                // two), or put back by an earlier undo: the target is the
+                // previous file -- the very same one, for a hard-link backup.
+                // Nothing to do. If that can't be told, nothing is overwritten.
                 const Sameness same = compareFiles(backup, target);
 
                 if (same == Sameness::Same) {
@@ -1031,43 +1212,36 @@ bool undo(const std::wstring& appDir, std::wstring& error) {
                 continue;
             }
 
-            // One rename puts the old file back; the target is never missing.
-            if (testFails(L"LIMITNV_TEST_FAIL_RESTORE_REPLACE", it->path)
-                || !MoveFileExW(backup.c_str(), target.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-                // A running exe can be renamed but not replaced, and the only
-                // program file running now can be this helper (run by hand
-                // from the program folder). Only that one is moved aside
-                // first; anything else stays as it is and is tried again
-                // later -- moving it aside could leave no file at all if this
-                // stopped halfway.
-                const std::wstring trash = now == PathState::File && isOwnImage(target) ? freeTrashName(appDir)
-                                                                                        : std::wstring();
-
-                if (trash.empty() || !MoveFileExW(target.c_str(), trash.c_str(), MOVEFILE_WRITE_THROUGH)) {
-                    failed += L"\n" + it->path;
-                    continue;
-                }
-
-                testPause(L"LIMITNV_TEST_PAUSE_RESTORE_ASIDE");
-
-                if (!MoveFileExW(backup.c_str(), target.c_str(), MOVEFILE_WRITE_THROUGH)) {
-                    MoveFileExW(trash.c_str(), target.c_str(), MOVEFILE_WRITE_THROUGH);   // as it was
-                    failed += L"\n" + it->path;
-                }
+            if (!restoreFile(appDir, backup, target, it->path, now)) {
+                failed += L"\n" + it->path;
             }
         } else if (it->kind == L'D') {
-            RemoveDirectoryW(target.c_str());   // only if empty; fine if not
+            if (probe(target) == PathState::Directory) {
+                RemoveDirectoryW(target.c_str());   // only if empty; fine if not
+            }
         }
     }
 
-    // Your settings as they were before the update. Moved, not copied: one
-    // step, and once it's done a repeated undo has nothing more to do here.
-    const std::wstring savedConfig = workFile(appDir, SAVED_CONFIG);
+    // Your settings as they were before the update: put back from the saved
+    // copy (kept, so a repeated undo does the same), or -- if there were none
+    // -- the new version's are removed. Anything else can't be told apart
+    // from a lost copy, so it is a failure, never "nothing to do".
+    const std::wstring config      = appDir + L"\\config.json";
+    const PathState    savedState  = probe(workFile(appDir, SAVED_CONFIG));
+    const PathState    absentState = probe(workFile(appDir, CONFIG_ABSENT));
 
-    if (probe(savedConfig) == PathState::File
-        && !MoveFileExW(savedConfig.c_str(), (appDir + L"\\config.json").c_str(),
-                        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-        failed += L"\nconfig.json";
+    if (savedState == PathState::File) {
+        if (!restoreFile(appDir, workFile(appDir, SAVED_CONFIG), config, L"config.json", probe(config))) {
+            failed += L"\nconfig.json (your settings)";
+        }
+    } else if (savedState == PathState::Missing && absentState == PathState::File) {
+        const PathState now = probe(config);
+
+        if ((now == PathState::File && !takeOut(appDir, config)) || (now != PathState::File && now != PathState::Missing)) {
+            failed += L"\nconfig.json (your settings)";
+        }
+    } else {
+        failed += L"\nconfig.json (your settings: the copy saved before the update is missing)";
     }
 
     if (!failed.empty()) {
@@ -1125,28 +1299,22 @@ bool retire(const std::wstring& appDir) {
 }
 
 void deleteTombstones(const std::wstring& appDir) {
+    testPause(L"LIMITNV_TEST_PAUSE_BEFORE_SWEEP");   // test only
     std::vector<std::wstring> found;
 
-    // Finished work folders, and any left by a crash while one was being set
-    // up. Only folders with the marker are ours; an empty one being set up
-    // (a crash right after it was created) goes too.
-    for (const wchar_t* prefix : { TOMBSTONE, BUILDING }) {
-        WIN32_FIND_DATAW data;
-        HANDLE           find = FindFirstFileW((appDir + L"\\" + prefix + L"*").c_str(), &data);
+    // Finished work folders only (with the marker: ours). Folders being set
+    // up have other names and are left to openWorkDir(): one may be in use
+    // right now.
+    WIN32_FIND_DATAW data;
+    HANDLE           find = FindFirstFileW((appDir + L"\\" + TOMBSTONE + L"*").c_str(), &data);
 
-        if (find == INVALID_HANDLE_VALUE) {
-            continue;
-        }
-
+    if (find != INVALID_HANDLE_VALUE) {
         do {
             const std::wstring dir = appDir + L"\\" + data.cFileName;
 
-            if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && !(data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
-                if (fileExists(dir + L"\\" + OWNER_FILE)) {
-                    found.push_back(dir);
-                } else if (prefix == BUILDING) {
-                    RemoveDirectoryW(dir.c_str());   // only if empty
-                }
+            if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && !(data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)
+                && fileExists(dir + L"\\" + OWNER_FILE)) {
+                found.push_back(dir);
             }
         } while (FindNextFileW(find, &data));
 

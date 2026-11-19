@@ -195,3 +195,62 @@ the helper starts (`--after-update`) skips the lock check and retries the
 mutex for up to 5 s, in case a copy started by hand holds it for the moment
 it takes to give way. Manual recovery takes the lock before it checks for a
 running copy.
+
+## Compatibility (review 5, V2)
+
+An update is installed by the **new** package's helper, on behalf of the
+**old** program. So the helper's command line and exit codes are a contract
+with every earlier version, and only ever grow:
+
+- `install <process> [<accepted event>] [--show]` -- without the event
+  (5.3.0 development builds before the hand-off check) the old program has
+  closed already and the helper just goes ahead.
+- `recover [<process> [<accepted event>]] [--show]`.
+- Exit codes before "accepted": 3 busy, 4 no package (reason in
+  `result.txt`), 5 unsupported (reserved: a future helper that can't serve
+  this program exits with 5 before "accepted"; the program keeps running and
+  says to download the release by hand).
+- The work-folder layout the old program prepares (`owner.txt`,
+  `download\unpacked\<top>`, `helper\limit-nvpstate-updater.exe`) is part of
+  the contract too.
+
+The helper and the new version it starts (`--after-update <event>`) always
+come from the same package. Pre-helper development builds (in-app install)
+have no supported in-place path: update them by hand.
+
+## Review 5 changes
+
+- **Writer = reader (V1):** the swap formats its plan and reads it back with
+  recovery's own parser (`journalProblem`) before it writes anything; a plan
+  recovery couldn't replay is refused, nothing changed. Journal text is
+  capped at `MAX_JOURNAL_CHARS`, inside what the file reader accepts.
+- **Settings (V3):** `config.json` is copied, or "there was none" is recorded,
+  before the swap; a settings file that can't be examined stops the update.
+  Undo restores the copy (kept), or removes the new version's file, or --
+  when neither record is there -- fails into "needs repair".
+- **Set-up folders (V4):** `limit-nvpstate-update.new-*` is used only by
+  `openWorkDir()`, which also clears leftovers of a crashed set-up; the
+  background sweep deletes tombstones only. A taken name is never touched:
+  another name is tried.
+- **Hand-off (V5):** "accepted" counts only if the helper is still running
+  when it is seen; a helper that ends without it changed nothing. A helper
+  that didn't answer is stopped, and only a confirmed stop is "refused";
+  otherwise the program keeps running, keeps the folder, and starts no other
+  update in that session. The helper stops if it can't set "accepted". After
+  refusing because another copy runs, it waits (30 s) for that copy to go and
+  then starts the program.
+- **Trial (V6):** the new version's settings and menus are greyed out until
+  the helper is done with it.
+- **Sessions (V7):** the locks are per Windows session; the README says to
+  close copies in other sessions before updating.
+- **Undo (V8):** a backup is put back through a hard link (or flushed copy)
+  renamed over the target, so the backup is kept and a repeated undo finds
+  the same file. A backup that is missing for a file that was moved in is a
+  failure, not "never replaced". Every folder on the way to a file (program,
+  package, backup) must be a plain folder, never a link. Run by hand from
+  the program folder, the helper hands the job to its copy in the work
+  folder, so it never has to move itself aside.
+- **Zip and trust (V9):** the central directory must be used up exactly; the
+  zip and checksum must come from exactly
+  `https://github.com/NicholasBly/limit-nvpstate/releases/download/<tag>/<name>`;
+  the "Update now" question says updates are not signed.

@@ -26,6 +26,7 @@ constexpr DWORD ACCEPT_MS = 45000;   // the helper to take over (it may wait 30 
 
 const wchar_t RELEASES_PAGE[] = L"https://github.com/NicholasBly/limit-nvpstate/releases";
 const wchar_t LATEST_API[]    = L"https://api.github.com/repos/NicholasBly/limit-nvpstate/releases/latest";
+const char    DOWNLOADS[]     = "https://github.com/NicholasBly/limit-nvpstate/releases/download/";   // same repo
 
 constexpr long long MAX_API_BYTES      = 1LL << 20;     // 1 MiB of JSON
 constexpr long long MAX_CHECKSUM_BYTES = 4096;
@@ -41,9 +42,23 @@ std::wstring latestApiUrl() {
     const DWORD n = GetEnvironmentVariableW(L"LIMITNV_UPDATE_API", buffer, 1024);
     return (n > 0 && n < 1024) ? std::wstring(buffer, n) : std::wstring(LATEST_API);
 }
+// Where the release's files must be: "<downloads>/<tag>/<name>" on GitHub;
+// in test builds, "<the test server>/dl/<name>" (the rig's layout).
+std::string downloadPrefix(const std::string& tag) {
+    const std::wstring api    = latestApiUrl();
+    const size_t       scheme = api.find(L"://");
+    const size_t       path   = scheme == std::wstring::npos ? std::wstring::npos : api.find(L'/', scheme + 3);
+
+    if (api == LATEST_API || path == std::wstring::npos) {
+        return std::string(DOWNLOADS) + tag + "/";
+    }
+
+    return std::string(api.begin(), api.begin() + static_cast<std::ptrdiff_t>(path)) + "/dl/";   // ASCII URL
+}
 #else
 bool         allowHttp() { return false; }
 std::wstring latestApiUrl() { return LATEST_API; }
+std::string  downloadPrefix(const std::string& tag) { return std::string(DOWNLOADS) + tag + "/"; }
 #endif
 
 std::wstring widen(const std::string& s) {
@@ -350,7 +365,11 @@ bool runTar(const std::wstring& zipPath, const std::wstring& outDir, std::wstrin
         return false;
     }
 
-    const std::wstring tar = std::wstring(system) + L"\\tar.exe";
+    std::wstring tar = std::wstring(system) + L"\\tar.exe";
+
+    if (std::wstring other; testText(L"LIMITNV_TEST_TAR", other)) {
+        tar = other;   // test only: the rig's stand-in, for tests that need it to misbehave
+    }
 
     if (!fileExists(tar)) {
         error = L"This version of Windows has no tar.exe (it ships with Windows 10 1803 and newer), so the "
@@ -449,14 +468,14 @@ bool readZipDirectory(const std::wstring& path, std::vector<updaterules::ZipEntr
 // its start would otherwise leave nothing running and nobody to say so. The
 // helper inherits two handles and nothing else: this process (to wait for)
 // and the "accepted" event.
-bool startHelper(const std::wstring& helperExe, const std::wstring& appDir, const wchar_t* mode, bool show,
-                 std::wstring& error) {
+HandOff startHelper(const std::wstring& helperExe, const std::wstring& appDir, const wchar_t* mode, bool show,
+                    std::wstring& error) {
     HANDLE self = nullptr;
 
     if (!DuplicateHandle(GetCurrentProcess(), GetCurrentProcess(), GetCurrentProcess(), &self,
                          SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, TRUE, 0)) {
         error = errorText(L"Could not prepare the updater", GetLastError());
-        return false;
+        return HandOff::Refused;
     }
 
     SECURITY_ATTRIBUTES inheritable = { sizeof(inheritable), nullptr, TRUE };
@@ -465,7 +484,7 @@ bool startHelper(const std::wstring& helperExe, const std::wstring& appDir, cons
     if (!accepted) {
         error = errorText(L"Could not prepare the updater", GetLastError());
         CloseHandle(self);
-        return false;
+        return HandOff::Refused;
     }
 
     std::wstring command = L"\"" + helperExe + L"\" " + mode + L" " + std::to_wstring(reinterpret_cast<uintptr_t>(self))
@@ -507,42 +526,64 @@ bool startHelper(const std::wstring& helperExe, const std::wstring& appDir, cons
     if (!started) {
         CloseHandle(accepted);
         error = errorText(L"Could not start the updater", launchError);
-        return false;
+        return HandOff::Refused;
     }
 
     CloseHandle(process.hThread);
 
+    testPause(L"LIMITNV_TEST_PAUSE_BEFORE_HANDOFF_WAIT");   // test only: the helper may have answered and ended
+
     HANDLE      waits[] = { accepted, process.hProcess };
-    const DWORD waited  = WaitForMultipleObjects(2, waits, FALSE, ACCEPT_MS);
-    bool        ok      = waited == WAIT_OBJECT_0;
+    const DWORD waited  = WaitForMultipleObjects(2, waits, FALSE, testValue(L"LIMITNV_TEST_ACCEPT_MS", ACCEPT_MS));
+    HandOff     result  = HandOff::Refused;
 
-    if (!ok) {
-        DWORD code = 0;
+    if (waited == WAIT_OBJECT_0 && WaitForSingleObject(process.hProcess, 0) == WAIT_TIMEOUT) {
+        result = HandOff::Accepted;   // it answered, and it is still there to do the job
+    } else if (waited == WAIT_OBJECT_0 || waited == WAIT_OBJECT_0 + 1) {
+        // Ended -- before answering, or right after (when both are seen at
+        // once, "accepted" alone would win). It changes files only after this
+        // process has closed, so nothing was changed.
+        DWORD              code   = 0;
+        const bool         known  = GetExitCodeProcess(process.hProcess, &code) != FALSE;
+        const std::wstring reason = updatetxn::readResult(appDir);
 
-        if (waited == WAIT_OBJECT_0 + 1 && GetExitCodeProcess(process.hProcess, &code)) {
-            const std::wstring result = updatetxn::readResult(appDir);
-
-            // The helper's exit codes from before it takes over (updater-helper/main.cpp):
-            // 3 = EXIT_BUSY, 4 = EXIT_NO_PACKAGE (the reason is in result.txt).
-            if (code == 3) {
-                error = L"Another update is being installed right now";
-            } else if (code == 4 && !result.empty()) {
-                error = result;
-            } else {
-                error = L"The updater stopped before it took over (exit code " + std::to_wstring(code) + L")";
-            }
+        // The helper's exit codes from before it takes over (updater-helper/main.cpp):
+        // 3 = EXIT_BUSY, 4 = EXIT_NO_PACKAGE (the reason is in result.txt), 5 = EXIT_UNSUPPORTED.
+        if (waited == WAIT_OBJECT_0) {
+            error = L"The updater stopped right after it took over";
+        } else if (known && code == 3) {
+            error = L"Another update is being installed right now";
+        } else if (known && code == 4 && !reason.empty()) {
+            error = reason;
+        } else if (known && code == 5) {
+            error = L"This update can't be installed from this version. Download it from the releases page and unzip "
+                    L"it over this folder";
         } else {
-            // No answer. It has touched nothing yet (that comes only after
-            // "accepted" and this process closing), so it is stopped.
-            TerminateProcess(process.hProcess, 1);
-            WaitForSingleObject(process.hProcess, 5000);
+            error = L"The updater stopped before it took over (exit code " + std::to_wstring(code) + L")";
+        }
+    } else {
+        // No answer in time (or the wait failed). It has touched nothing yet
+        // -- that comes only after "accepted" and this process closing -- so
+        // it is stopped; but only a confirmed stop makes it over.
+        TerminateProcess(process.hProcess, 1);
+        DWORD gone = WaitForSingleObject(process.hProcess, 5000);
+
+        if (testFails(L"LIMITNV_TEST_FAIL_HELPER_TERMINATE", L"1")) {
+            gone = WAIT_TIMEOUT;   // test only: it could not be confirmed stopped
+        }
+
+        if (gone == WAIT_OBJECT_0) {
             error = L"The updater did not respond";
+        } else {
+            result = HandOff::Unresolved;
+            error  = L"The updater did not respond and could not be stopped. Restart Windows before you try to update "
+                     L"again";
         }
     }
 
     CloseHandle(accepted);
     CloseHandle(process.hProcess);
-    return ok;
+    return result;
 }
 
 } // namespace
@@ -596,6 +637,19 @@ bool fetchLatest(Release& out, std::wstring& error) {
 
     if (choice.zip < 0) {
         error = L"The latest release has no limit-nvpstate-" + widen(out.version) + L".zip";
+        return false;
+    }
+
+    // From this project's own release downloads, exactly: a release that
+    // lists its files anywhere else is not downloaded.
+    const std::string prefix = downloadPrefix(out.version);
+    const size_t      zip    = static_cast<size_t>(choice.zip);
+
+    if (!updaterules::isExpectedAssetUrl(urls[zip], prefix, names[zip])
+        || (choice.checksum >= 0
+            && !updaterules::isExpectedAssetUrl(urls[static_cast<size_t>(choice.checksum)], prefix,
+                                                names[static_cast<size_t>(choice.checksum)]))) {
+        error = L"The release's download address is not the expected one, so it was not downloaded";
         return false;
     }
 
@@ -824,7 +878,7 @@ void discardDownload(const std::wstring& appDir) {
     updatetxn::discardDownload(appDir);
 }
 
-bool launchHelper(const std::wstring& appDir, bool show, std::wstring& error) {
+HandOff launchHelper(const std::wstring& appDir, bool show, std::wstring& error) {
     return startHelper(updatetxn::helperPath(appDir), appDir, L"install", show, error);
 }
 
@@ -868,7 +922,7 @@ StartupState checkAtStartup(const std::wstring& appDir, bool justRecovered, std:
     const std::wstring copy      = updatetxn::helperPath(appDir);
     const std::wstring installed = appDir + L"\\limit-nvpstate-updater.exe";
 
-    if (startHelper(updatetxn::fileExists(copy) ? copy : installed, appDir, L"recover", false, error)) {
+    if (startHelper(updatetxn::fileExists(copy) ? copy : installed, appDir, L"recover", false, error) == HandOff::Accepted) {
         return StartupState::Recovering;
     }
 

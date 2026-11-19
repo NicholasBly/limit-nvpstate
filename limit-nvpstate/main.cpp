@@ -145,6 +145,7 @@ int main(int argc, char* argv[]) {
     // version it started): it starts the program itself when it is done. Only
     // the new version it starts gets past this. Exiting lets go of the mutex.
     if (!afterUpdate && updatetxn::updateLockHeld()) {
+        testPause(L"LIMITNV_TEST_PAUSE_BEFORE_GIVING_WAY");   // test only: slow to close
         return 0;
     }
 
@@ -222,6 +223,10 @@ int main(int argc, char* argv[]) {
     }
 
     if (afterUpdate) {
+        // While the helper is still checking this new version, its settings
+        // can't be changed: it may be undone in a moment, and its changes
+        // (another GPU, say) with it. finishUpdateLater() unlocks them.
+        w.setSettingsLocked(true);
         w.signalReadyLater(launch.ready);
     }
 

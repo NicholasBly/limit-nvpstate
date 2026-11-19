@@ -29,7 +29,11 @@ Example: add `FortniteClient-Win64-Shipping.exe` (the game itself, not the Epic 
 How the update is installed:
 
 - A small separate program, `limit-nvpstate-updater.exe`, swaps the files once limit-nvpstate has closed. It backs up every file it replaces first.
-- The new version then has to start and keep running for a few seconds. If it doesn't, the update is undone and the previous version starts again, with a message saying why. Your settings are put back too.
+- The new version then has to start and keep running for a few seconds. Its settings are greyed out until that check is done. If it doesn't pass, the update is undone and the previous version starts again, with a message saying why. Your settings are put back too.
 - If the computer crashes or loses power in the middle, the next start of limit-nvpstate finishes undoing the update. If that can't be finished either, limit-nvpstate shows what to do and doesn't run until it's fixed. You can also run `limit-nvpstate-updater.exe` in the program folder yourself to undo an unfinished update.
+
+**One Windows session at a time:** if limit-nvpstate is also running in another user session on this PC (Fast User Switching, Remote Desktop), close it there before you update.
+
+**Test builds from before the updater:** early 5.3.0 development builds that installed updates by themselves can't update to a release. Download it and unzip it over the program folder instead.
 
 **What the update trusts:** the download comes over HTTPS from this project's GitHub releases, and its SHA-256 checksum file comes from the same release. The checksum catches a broken or incomplete download. It does **not** prove who made the release: anyone who could publish a release on this GitHub account could also publish a harmful update, and it would install with administrator rights, as limit-nvpstate itself runs with them. Releases are not code-signed. If that matters to you, download releases yourself from the releases page and check them before you run them, instead of using **Update now**.
