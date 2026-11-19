@@ -76,6 +76,9 @@ def wine_temp_dirs():
             f'{WINEPREFIX}/drive_c/windows/temp']
 
 
+# Print every UI dump in the timeline (CI: the logs are all there is).
+VERBOSE_DUMPS = WINDOWS or bool(os.environ.get('LIMITNV_VERBOSE'))
+
 # Scenarios that need what only the Wine rig has (the fgshim foreground and
 # process-scan stand-ins), or a build only it makes. Skipped on Windows.
 WINE_ONLY = set()
@@ -189,6 +192,8 @@ class Run:
             if result is not None:
                 break
             time.sleep(0.05)
+        if line == 'dump' and result is not None and VERBOSE_DUMPS:
+            self.note('  -> ' + result[:300])   # what the app showed: the evidence when a check fails
         time.sleep(settle)
         return result if result is not None else 'NO ACK (app hung or gone)'
 
@@ -332,7 +337,14 @@ def main():
         print((SCENARIOS[name].__doc__ or '').strip())
         for v in variants:
             reset_wine()
-            r = SCENARIOS[name](v)
+            try:
+                r = SCENARIOS[name](v)
+            except Exception:
+                import traceback
+                print(f'\n--- {v}: FAIL (the scenario itself raised)\n' + traceback.format_exc(), flush=True)
+                summary.append((name, v, False))
+                reset_wine()
+                continue
             r.finish()
             ok = all(str(e) == str(a) for _, e, a in r.checks)
             summary.append((name, v, ok))
