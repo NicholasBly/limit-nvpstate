@@ -63,18 +63,26 @@ $common = @("-p:Configuration=Release", "-p:Platform=x64", "-p:SolutionDir=$repo
 
 MSBuild.exe "$repo\limit-nvpstate\limit-nvpstate.vcxproj" @common `
     "-p:AppVersion=$Version" `
-    "-p:LimitnvTestDefines=LIMITNV_TEST_HOOKS%3BLIMITNV_UPDATE_TEST" `
+    "-p:LimitnvTestBuild=true" `
     "-p:LimitnvTestHook=$h\mock\testhook.cpp" `
     "-p:NvapiLib=$bin\nvapi64.lib" `
     "-p:OutDir=$work\app\\" "-p:IntDir=$work\app-obj\\" | Out-Host
 Assert-Ok "app build"
 
 MSBuild.exe "$repo\updater-helper\limit-nvpstate-updater.vcxproj" @common `
-    "-p:LimitnvTestDefines=LIMITNV_TEST_HOOKS" `
+    "-p:LimitnvTestBuild=true" `
     "-p:OutDir=$work\helper\\" "-p:IntDir=$work\helper-obj\\" | Out-Host
 Assert-Ok "helper build"
 
 Copy-Item "$work\app\limit-nvpstate.exe", "$work\helper\limit-nvpstate-updater.exe", "$bin\nvapi64.dll" $out
+
+# A test build must really be one: these names exist only when the test
+# defines reached the compiler (a release build talks to the real GitHub).
+foreach ($check in @(@("limit-nvpstate.exe", "LIMITNV_UPDATE_API"), @("limit-nvpstate.exe", "LIMITNV_TEST_PAUSE_AT_EXIT"),
+                     @("limit-nvpstate-updater.exe", "LIMITNV_TEST_OLD_EXIT_MS"))) {
+    $text = [System.Text.Encoding]::Unicode.GetString([System.IO.File]::ReadAllBytes("$out\$($check[0])"))
+    if (-not $text.Contains($check[1])) { throw "$($check[0]) was built without the test defines ($($check[1]) missing)" }
+}
 
 windeployqt.exe "$out\limit-nvpstate.exe" `
     --release `

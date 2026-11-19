@@ -18,9 +18,11 @@
     <QtMsBuild Condition="'$(QtMsBuild)'=='' OR !Exists('$(QtMsBuild)\qt.targets')">$(SolutionDir)QtMsBuild</QtMsBuild>
     <!-- Program version, compiled in as APP_VERSION (see version.h). build.ps1 -Version overrides it. -->
     <AppVersion Condition="'$(AppVersion)' == ''">5.3.0-dev</AppVersion>
-    <!-- Test builds only (tests/integration/build_windows.ps1): extra defines,
-         the UI test hook, and the mock NVAPI library. Empty for real builds. -->
-    <LimitnvTestDefines Condition="'$(LimitnvTestDefines)' == ''"></LimitnvTestDefines>
+    <!-- Test builds only (tests/integration/build_windows.ps1, LimitnvTestBuild=true):
+         the test defines, the UI test hook, and the mock NVAPI library. Empty for
+         real builds. (The define list lives here: a ";" on the MSBuild command line
+         would split it.) -->
+    <LimitnvTestDefines Condition="'$(LimitnvTestBuild)' == 'true'">LIMITNV_TEST_HOOKS;LIMITNV_UPDATE_TEST</LimitnvTestDefines>
     <NvapiLib Condition="'$(NvapiLib)' == ''">$(SolutionDir)nvapi\amd64\nvapi64.lib</NvapiLib>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />

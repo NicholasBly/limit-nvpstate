@@ -22,6 +22,10 @@
     <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
     <VcpkgEnabled>false</VcpkgEnabled>
   </PropertyGroup>
+  <PropertyGroup>
+    <!-- Test builds only (tests/integration/build_windows.ps1, LimitnvTestBuild=true). -->
+    <LimitnvTestDefines Condition="'$(LimitnvTestBuild)' == 'true'">LIMITNV_TEST_HOOKS</LimitnvTestDefines>
+  </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
     <ConfigurationType>Application</ConfigurationType>
