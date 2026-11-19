@@ -15,6 +15,19 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+
+// MinGW: dllexport on the definitions. MSVC refuses dllexport on functions
+// nvapi.h already declared without it (C2375), so it exports them by name.
+#ifdef _MSC_VER
+#define MOCK_EXPORT
+#pragma comment(linker, "/EXPORT:nvapi_QueryInterface")
+#pragma comment(linker, "/EXPORT:NvAPI_Initialize")
+#pragma comment(linker, "/EXPORT:NvAPI_EnumPhysicalGPUs")
+#pragma comment(linker, "/EXPORT:NvAPI_GPU_GetFullName")
+#pragma comment(linker, "/EXPORT:NvAPI_GPU_GetPstates20")
+#else
+#define MOCK_EXPORT __declspec(dllexport)
+#endif
 #include <vector>
 
 namespace {
@@ -140,7 +153,7 @@ NvAPI_Status __cdecl mockSetPstateClientLimits(NvPhysicalGpuHandle h, unsigned i
 
 extern "C" {
 
-__declspec(dllexport) void* __cdecl nvapi_QueryInterface(unsigned int id) {
+MOCK_EXPORT void* __cdecl nvapi_QueryInterface(unsigned int id) {
     if (id == 0xFDFC7D49u) {
         return reinterpret_cast<void*>(&mockSetPstateClientLimits);
     }
@@ -150,12 +163,12 @@ __declspec(dllexport) void* __cdecl nvapi_QueryInterface(unsigned int id) {
 
 } // extern "C"
 
-extern "C" __declspec(dllexport) NvAPI_Status __cdecl NvAPI_Initialize() {
+extern "C" MOCK_EXPORT NvAPI_Status __cdecl NvAPI_Initialize() {
     logLine("Initialize");
     return NVAPI_OK;
 }
 
-extern "C" __declspec(dllexport) NvAPI_Status __cdecl NvAPI_EnumPhysicalGPUs(NvPhysicalGpuHandle nvGPUHandle[NVAPI_MAX_PHYSICAL_GPUS], NvU32* pGpuCount) {
+extern "C" MOCK_EXPORT NvAPI_Status __cdecl NvAPI_EnumPhysicalGPUs(NvPhysicalGpuHandle nvGPUHandle[NVAPI_MAX_PHYSICAL_GPUS], NvU32* pGpuCount) {
     const int n = envInt("MOCK_NV_GPUS", 1);
     for (int i = 0; i < n; i++) {
         nvGPUHandle[i] = reinterpret_cast<NvPhysicalGpuHandle>(uintptr_t(0x1000 + i));
@@ -165,13 +178,13 @@ extern "C" __declspec(dllexport) NvAPI_Status __cdecl NvAPI_EnumPhysicalGPUs(NvP
     return NVAPI_OK;
 }
 
-extern "C" __declspec(dllexport) NvAPI_Status __cdecl NvAPI_GPU_GetFullName(NvPhysicalGpuHandle hPhysicalGpu, NvAPI_ShortString szName) {
+extern "C" MOCK_EXPORT NvAPI_Status __cdecl NvAPI_GPU_GetFullName(NvPhysicalGpuHandle hPhysicalGpu, NvAPI_ShortString szName) {
     const int gpu = gpuIndex(hPhysicalGpu);
     std::snprintf(szName, NVAPI_SHORT_STRING_MAX, "Mock GeForce #%d", gpu);
     return gpu < 0 ? NVAPI_INVALID_ARGUMENT : NVAPI_OK;
 }
 
-extern "C" __declspec(dllexport) NvAPI_Status __cdecl NvAPI_GPU_GetPstates20(NvPhysicalGpuHandle hPhysicalGpu, NV_GPU_PERF_PSTATES20_INFO* info) {
+extern "C" MOCK_EXPORT NvAPI_Status __cdecl NvAPI_GPU_GetPstates20(NvPhysicalGpuHandle hPhysicalGpu, NV_GPU_PERF_PSTATES20_INFO* info) {
     const int gpu = gpuIndex(hPhysicalGpu);
     if (gpu < 0 || !info) return NVAPI_INVALID_ARGUMENT;
 
