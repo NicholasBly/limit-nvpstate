@@ -29,15 +29,16 @@ function Assert-Ok([string] $What) {
 if ($Mocks) {
     New-Item -ItemType Directory -Force $bin | Out-Null
     Push-Location $bin
+    $libs = @("user32.lib", "shell32.lib", "shlwapi.lib", "advapi32.lib")
     try {
         cl /nologo /std:c++17 /EHsc /O2 /utf-8 /LD "/I$repo\nvapi" "$h\mock\nvapi_mock.cpp" /Fe:nvapi64.dll /link /IMPLIB:nvapi64.lib
         Assert-Ok "nvapi mock"
         foreach ($p in "exit3", "fake_tar", "fg", "filelock", "holder", "winlist") {
-            cl /nologo /std:c++17 /EHsc /O2 /utf-8 "$h\mock\$p.cpp" /Fe:"$p.exe" /link user32.lib
+            cl /nologo /std:c++17 /EHsc /O2 /utf-8 "$h\mock\$p.cpp" /Fe:"$p.exe" /link $libs
             Assert-Ok $p
         }
         foreach ($p in "dummy_game", "ready_then_exit") {
-            cl /nologo /std:c++17 /EHsc /O2 /utf-8 "$h\mock\$p.cpp" /Fe:"$p.exe" /link /SUBSYSTEM:WINDOWS user32.lib shlwapi.lib
+            cl /nologo /std:c++17 /EHsc /O2 /utf-8 "$h\mock\$p.cpp" /Fe:"$p.exe" /link /SUBSYSTEM:WINDOWS $libs
             Assert-Ok $p
         }
         Copy-Item dummy_game.exe gameA.exe
