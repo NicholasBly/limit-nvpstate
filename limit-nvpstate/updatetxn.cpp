@@ -623,7 +623,11 @@ bool openWorkDir(const std::wstring& appDir, std::wstring& error) {
         // stopped halfway could take owner.txt and leave a folder that blocks
         // every later update. The tombstone is deleted after a later update.
         if (!retire(appDir)) {
-            error = errorText((L"Could not clear the updater's folder (" + dir + L")").c_str(), GetLastError());
+            // On Windows a folder can't be renamed while a file in it is open
+            // (a virus scanner reading the old download, say).
+            const DWORD code = GetLastError();
+            error = errorText((L"Could not clear the updater's folder (" + dir + L"). If a file in it is in use, try "
+                               L"again in a minute").c_str(), code);
             return false;
         }
     }

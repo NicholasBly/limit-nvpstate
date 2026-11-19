@@ -134,6 +134,15 @@ def fx9_leftover_folder_locked(v):
         open(f'{r.dir}/{WORK}/download/locked.bin', 'w').write('x')
         lock_file(f'{r.dir}/{WORK}/download/locked.bin', 40000)
         update_now(r, settle=16.0)
+        if dumpv(r, 'version') != '9.9.9':
+            # Real Windows can't rename a folder while a file in it is open
+            # (Wine can): then it must refuse with the folder intact, and the
+            # next try -- once the file is closed -- must work.
+            r.check_value('refused, says why', True, 'Could not clear' in dumpv(r, 'msgtext'))
+            r.check_value('the folder is intact', True, os.path.exists(f'{r.dir}/{WORK}/owner.txt'))
+            r.cmd('msgclick OK', settle=1.0)
+            time.sleep(25.0)   # the lock (40 s) is gone by now
+            update_now(r, settle=16.0)
         r.check_value('the update went ahead', '9.9.9', dumpv(r, 'version'))
         return r
     finally:

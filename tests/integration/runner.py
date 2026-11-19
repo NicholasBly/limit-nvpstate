@@ -141,10 +141,16 @@ class Run:
         self.app = wine(self.dir + '/' + getattr(self, 'exe', 'limit-nvpstate.exe'), wait=False, env=self.env, cwd=self.dir)
         self.procs.append(self.app)
         before = open(self.nvlog).read().count('EnumPhysicalGPUs') if os.path.exists(self.nvlog) else 0
+        sets_before = len(self.sets())
         deadline = time.time() + 20
         while time.time() < deadline:
             if os.path.exists(self.nvlog) and open(self.nvlog).read().count('EnumPhysicalGPUs') > before:
                 break
+            time.sleep(0.1)
+        # Then its first decision (on Windows it can come a second or two
+        # after the GPU list; a start that sends none just waits this out).
+        deadline = time.time() + 8
+        while time.time() < deadline and len(self.sets()) == sets_before:
             time.sleep(0.1)
         time.sleep(settle)
 
