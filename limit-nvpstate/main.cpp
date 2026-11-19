@@ -8,8 +8,6 @@
 #include <version.h>
 
 #include <QApplication>
-#include <QMessageBox>
-#include <QTimer>
 #include <QIcon>
 #include <QWinEventNotifier>
 
@@ -96,22 +94,31 @@ void showRunningCopy() {
 // The handle is intentionally left open for the process lifetime; Windows
 // releases it on exit. GetLastError() is read immediately, before anything
 // else can clobber it. False: another instance runs (and was asked to show).
-bool becomeSingleInstance() {
-    const HANDLE instanceMutex = CreateMutexW(nullptr, TRUE, L"Local\\limit-nvpstate");
-    const DWORD  mutexError    = GetLastError();
+// `retryMs`: keep trying that long -- for the new version the updater starts,
+// in case a copy started by hand holds the mutex for the moment it takes to
+// see the update lock and give way.
+bool becomeSingleInstance(DWORD retryMs) {
+    for (DWORD waited = 0;; waited += 100) {
+        const HANDLE instanceMutex = CreateMutexW(nullptr, TRUE, L"Local\\limit-nvpstate");
+        const DWORD  mutexError    = GetLastError();
 
-    if (!instanceMutex || mutexError == ERROR_ALREADY_EXISTS) {
-        showRunningCopy();
-        return false;
+        if (instanceMutex && mutexError != ERROR_ALREADY_EXISTS) {
+            break;
+        }
+
+        if (instanceMutex) {
+            CloseHandle(instanceMutex);
+        }
+
+        if (waited >= retryMs) {
+            showRunningCopy();
+            return false;
+        }
+
+        Sleep(100);
     }
 
     return true;
-}
-
-void showPlainWarning(const QString& text) {
-    QMessageBox box(QMessageBox::Warning, QStringLiteral("limit-nvpstate"), text);
-    box.setTextFormat(Qt::PlainText);
-    box.exec();
 }
 
 } // namespace
@@ -123,33 +130,44 @@ int main(int argc, char* argv[]) {
     const bool          afterUpdate = launch.ready != nullptr;
     const std::wstring  appDir      = getProgramDirectory();
 
-    // The updater helper is at work (swapping files, or deciding about a new
-    // version it started): it starts the program itself when it is done. Only
-    // the new version it starts gets past this.
-    if (!afterUpdate && updatetxn::updateLockHeld()) {
-        showRunningCopy();   // the new version, if it is up yet
+    // The single-instance mutex first, then the update lock -- in this order.
+    // The updater takes its lock before the running copy closes (and lets go
+    // of the mutex), so a copy that gets the mutex later always sees the lock.
+    // The other way round, a copy held up between the two checks could slip
+    // in while the files are being swapped.
+    if (!becomeSingleInstance(afterUpdate ? 5000 : 0)) {
         return 0;
     }
 
-    if (!becomeSingleInstance()) {
+    testPause(L"LIMITNV_TEST_PAUSE_AT_START_CHECKS");   // test only: between the two start checks
+
+    // The updater helper is at work (swapping files, or deciding about a new
+    // version it started): it starts the program itself when it is done. Only
+    // the new version it starts gets past this. Exiting lets go of the mutex.
+    if (!afterUpdate && updatetxn::updateLockHeld()) {
         return 0;
     }
 
     // An update the helper could not finish (a crash, a power cut): it is
     // started again to undo it, and starts the program afterwards. This copy
     // may be running a mix of old and new files, so it stops here, before
-    // touching config or the GPU.
-    std::wstring repairMessage;
-
+    // touching config or the GPU -- also when the undo itself could not
+    // finish: then it says what to do, and stops.
     if (!afterUpdate) {
+        std::wstring                repairMessage;
         const updater::StartupState startup = updater::checkAtStartup(appDir, launch.recovered, repairMessage);
 
         if (startup == updater::StartupState::Recovering) {
             return 0;
         }
 
-        if (startup != updater::StartupState::NeedsRepair) {
-            repairMessage.clear();
+        if (startup == updater::StartupState::NeedsRepair) {
+            const std::wstring text =
+                repairMessage + L"\n\nlimit-nvpstate won't run until this is fixed, so it is not managing the GPU now. "
+                                L"Start limit-nvpstate again to retry. If that keeps failing: download limit-nvpstate "
+                                L"again, unzip it over this folder, then delete the limit-nvpstate-update folder.";
+            MessageBoxW(nullptr, text.c_str(), L"limit-nvpstate", MB_ICONERROR | MB_OK);
+            return 1;
         }
     }
 
@@ -168,6 +186,11 @@ int main(int argc, char* argv[]) {
                     L"limit-nvpstate",
                     MB_ICONERROR | MB_OK);
         return 1;
+    }
+
+    if (afterUpdate && testFails(L"LIMITNV_TEST_TOUCH_CONFIG", L"1")) {
+        config["test_touched"] = true;   // test only: a new version that changes your settings
+        saveConfig();
     }
 
     // Qt's fallback session management closes every visible window at logoff
@@ -216,11 +239,6 @@ int main(int argc, char* argv[]) {
 
     if (launch.show || !config["start_minimized"].get<bool>()) {
         w.show();
-    }
-
-    if (!repairMessage.empty()) {
-        const QString text = QString::fromStdWString(repairMessage);
-        QTimer::singleShot(0, &w, [text]() { showPlainWarning(text); });
     }
 
     const int code = a.exec();

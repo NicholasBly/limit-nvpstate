@@ -22,6 +22,8 @@ namespace updater {
 
 namespace {
 
+constexpr DWORD ACCEPT_MS = 45000;   // the helper to take over (it may wait 30 s for the update lock)
+
 const wchar_t RELEASES_PAGE[] = L"https://github.com/NicholasBly/limit-nvpstate/releases";
 const wchar_t LATEST_API[]    = L"https://api.github.com/repos/NicholasBly/limit-nvpstate/releases/latest";
 
@@ -442,6 +444,11 @@ bool readZipDirectory(const std::wstring& path, std::vector<updaterules::ZipEntr
 
 // Starts the helper with an inherited handle to this process (it waits for
 // us to exit before touching anything); that handle is the only one it gets.
+// Starts the helper and waits until it has taken over (or has ended, or a
+// deadline passed). Only then may this process close: a helper that dies at
+// its start would otherwise leave nothing running and nobody to say so. The
+// helper inherits two handles and nothing else: this process (to wait for)
+// and the "accepted" event.
 bool startHelper(const std::wstring& helperExe, const std::wstring& appDir, const wchar_t* mode, bool show,
                  std::wstring& error) {
     HANDLE self = nullptr;
@@ -452,22 +459,33 @@ bool startHelper(const std::wstring& helperExe, const std::wstring& appDir, cons
         return false;
     }
 
-    std::wstring command = L"\"" + helperExe + L"\" " + mode + L" "
-                         + std::to_wstring(reinterpret_cast<uintptr_t>(self));
+    SECURITY_ATTRIBUTES inheritable = { sizeof(inheritable), nullptr, TRUE };
+    HANDLE              accepted    = CreateEventW(&inheritable, TRUE, FALSE, nullptr);
+
+    if (!accepted) {
+        error = errorText(L"Could not prepare the updater", GetLastError());
+        CloseHandle(self);
+        return false;
+    }
+
+    std::wstring command = L"\"" + helperExe + L"\" " + mode + L" " + std::to_wstring(reinterpret_cast<uintptr_t>(self))
+                         + L" " + std::to_wstring(reinterpret_cast<uintptr_t>(accepted));
 
     if (show) {
         command += L" --show";
     }
 
+    HANDLE inherited[] = { self, accepted };
     SIZE_T attributeSize = 0;
     InitializeProcThreadAttributeList(nullptr, 1, 0, &attributeSize);
 
     std::vector<char>            buffer(attributeSize ? attributeSize : 1);
-    LPPROC_THREAD_ATTRIBUTE_LIST attributes = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(buffer.data());
-
-    const bool listed = attributeSize > 0 && InitializeProcThreadAttributeList(attributes, 1, 0, &attributeSize)
-                     && UpdateProcThreadAttribute(attributes, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, &self, sizeof(self),
-                                                  nullptr, nullptr);
+    LPPROC_THREAD_ATTRIBUTE_LIST attributes  = reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(buffer.data());
+    const bool                   initialized = attributeSize > 0
+                                && InitializeProcThreadAttributeList(attributes, 1, 0, &attributeSize);
+    const bool listed = initialized
+                     && UpdateProcThreadAttribute(attributes, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherited,
+                                                  sizeof(inherited), nullptr, nullptr);
 
     STARTUPINFOEXW      startup = {};
     PROCESS_INFORMATION process = {};
@@ -480,20 +498,51 @@ bool startHelper(const std::wstring& helperExe, const std::wstring& appDir, cons
                                            &process);
     const DWORD launchError = GetLastError();
 
-    if (listed) {
+    if (initialized) {
         DeleteProcThreadAttributeList(attributes);
     }
 
     CloseHandle(self);   // the helper has its own copy now (or never will)
 
     if (!started) {
+        CloseHandle(accepted);
         error = errorText(L"Could not start the updater", launchError);
         return false;
     }
 
     CloseHandle(process.hThread);
+
+    HANDLE      waits[] = { accepted, process.hProcess };
+    const DWORD waited  = WaitForMultipleObjects(2, waits, FALSE, ACCEPT_MS);
+    bool        ok      = waited == WAIT_OBJECT_0;
+
+    if (!ok) {
+        DWORD code = 0;
+
+        if (waited == WAIT_OBJECT_0 + 1 && GetExitCodeProcess(process.hProcess, &code)) {
+            const std::wstring result = updatetxn::readResult(appDir);
+
+            // The helper's exit codes from before it takes over (updater-helper/main.cpp):
+            // 3 = EXIT_BUSY, 4 = EXIT_NO_PACKAGE (the reason is in result.txt).
+            if (code == 3) {
+                error = L"Another update is being installed right now";
+            } else if (code == 4 && !result.empty()) {
+                error = result;
+            } else {
+                error = L"The updater stopped before it took over (exit code " + std::to_wstring(code) + L")";
+            }
+        } else {
+            // No answer. It has touched nothing yet (that comes only after
+            // "accepted" and this process closing), so it is stopped.
+            TerminateProcess(process.hProcess, 1);
+            WaitForSingleObject(process.hProcess, 5000);
+            error = L"The updater did not respond";
+        }
+    }
+
+    CloseHandle(accepted);
     CloseHandle(process.hProcess);
-    return true;
+    return ok;
 }
 
 } // namespace
@@ -709,8 +758,50 @@ bool prepare(const Release&      release,
                           return CompareStringOrdinal(a.c_str(), -1, b.c_str(), -1, TRUE) == CSTR_EQUAL;
                       });
 
-    if (!same) {
+    // Names alone aren't enough: the unzipper is a different program from
+    // the check above, so every file must also have the size the zip's list
+    // gives, and nothing may have been unpacked beside the package folder.
+    bool sizesMatch = same;
+
+    for (const updaterules::ZipEntry& entry : entries) {
+        if (!sizesMatch || entry.directory) {
+            continue;
+        }
+
+        std::wstring name(entry.name.begin(), entry.name.end());
+        std::replace(name.begin(), name.end(), L'/', L'\\');
+
+        WIN32_FILE_ATTRIBUTE_DATA data = {};
+        sizesMatch = GetFileAttributesExW((unpacked + L"\\" + name).c_str(), GetFileExInfoStandard, &data)
+                  && ((static_cast<unsigned long long>(data.nFileSizeHigh) << 32) | data.nFileSizeLow) == entry.size;
+    }
+
+    bool onlyPackage = true;
+    WIN32_FIND_DATAW found;
+    HANDLE           find = FindFirstFileW((unpacked + L"\\*").c_str(), &found);
+
+    if (find == INVALID_HANDLE_VALUE) {
+        onlyPackage = false;
+    } else {
+        do {
+            const std::wstring child = found.cFileName;
+            onlyPackage &= child == L"." || child == L".."
+                        || CompareStringOrdinal(child.c_str(), -1, top.c_str(), -1, TRUE) == CSTR_EQUAL;
+        } while (FindNextFileW(find, &found));
+
+        onlyPackage &= GetLastError() == ERROR_NO_MORE_FILES;
+        FindClose(find);
+    }
+
+    if (!same || !sizesMatch || !onlyPackage) {
         error = L"The unpacked files don't match the update package's list, so it was not installed";
+        return false;
+    }
+
+    // The limits on the real files, before any of them (the helper) runs.
+    error = updaterules::packageProblem(files, bytes);
+
+    if (!error.empty()) {
         return false;
     }
 
@@ -768,10 +859,9 @@ StartupState checkAtStartup(const std::wstring& appDir, bool justRecovered, std:
     // put everything back. It is started to (try again to) undo it, then
     // starts the program again -- unless it just did.
     if (justRecovered) {
-        message = updatetxn::readResult(appDir) + L"\n\nThe files from before the update are in "
-                + updatetxn::backupDir(appDir)
-                + L". limit-nvpstate will try again at its next start. If it keeps failing, download it again and "
-                  L"unzip it over this folder, then delete the limit-nvpstate-update folder.";
+        const std::wstring result = updatetxn::readResult(appDir);
+        message = (result.empty() ? std::wstring(L"An update could not be fully undone.") : result)
+                + L"\n\nThe files from before the update are in " + updatetxn::backupDir(appDir) + L".";
         return StartupState::NeedsRepair;
     }
 

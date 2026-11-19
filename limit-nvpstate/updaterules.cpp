@@ -2,6 +2,7 @@
 
 #include <cctype>
 #include <cstddef>
+#include <map>
 
 namespace updaterules {
 
@@ -332,6 +333,10 @@ std::wstring formatJournal(const std::vector<JournalEntry>& entries) {
     return text;
 }
 
+namespace {
+constexpr size_t MAX_JOURNAL_ENTRIES = 4096;   // a package has at most 1000 files (and their folders)
+}
+
 bool parseJournal(const std::wstring& text, std::vector<JournalEntry>& out) {
     out.clear();
 
@@ -360,8 +365,10 @@ bool parseJournal(const std::wstring& text, std::vector<JournalEntry>& out) {
         entry.kind = line[0];
         entry.path = line.substr(2);
 
+        // One spelling per path: the swap writes backslashes only.
         if ((entry.kind != L'P' && entry.kind != L'D' && entry.kind != L'A' && entry.kind != L'R')
-            || !isSafeRelativePath(entry.path)) {
+            || !isSafeRelativePath(entry.path) || entry.path.find(L'/') != std::wstring::npos
+            || out.size() >= MAX_JOURNAL_ENTRIES) {
             return false;
         }
 
@@ -397,6 +404,26 @@ bool parseJournal(const std::wstring& text, std::vector<JournalEntry>& out) {
         }
 
         seen.push_back(key);
+    }
+
+    // A coherent tree: a folder comes before what's in it, and a file is
+    // never also used as a folder.
+    std::map<std::wstring, size_t> position;
+
+    for (size_t k = 1; k < out.size(); k++) {
+        position[seen[k - 1]] = k;
+    }
+
+    for (size_t k = 1; k < out.size(); k++) {
+        const std::wstring& key = seen[k - 1];
+
+        for (size_t slash = key.find(L'\\'); slash != std::wstring::npos; slash = key.find(L'\\', slash + 1)) {
+            const auto folder = position.find(key.substr(0, slash));
+
+            if (folder != position.end() && (out[folder->second].kind != L'D' || folder->second > k)) {
+                return false;
+            }
+        }
     }
 
     return true;

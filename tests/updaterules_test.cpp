@@ -426,6 +426,29 @@ void journal_v2_schema() {
     CHECK_EQ(parseJournal(formatJournal({ pkg, { L'D', L"plugins" }, { L'A', L"plugins\\a.dll" } }), out), true);
 }
 
+// Review 4, U10: the undo record is read with the same strictness the swap
+// wrote it with -- one spelling per path, folders before what's in them.
+void journal_pathRules() {
+    std::vector<JournalEntry> out;
+    const JournalEntry pkg = { L'P', L"download\\unpacked\\limit-nvpstate" };
+    CHECK_EQ(parseJournal(formatJournal({ pkg, { L'A', L"plugins/a.dll" } }), out), false);        // '/' spelling
+    CHECK_EQ(parseJournal(formatJournal({ { L'P', L"download/unpacked\\x" } }), out), false);
+    CHECK_EQ(parseJournal(formatJournal({ pkg, { L'D', L"plugins" }, { L'A', L"plugins" } }), out), false);   // folder and file
+    CHECK_EQ(parseJournal(formatJournal({ pkg, { L'A', L"a.dll" }, { L'A', L"a.dll\\b.dll" } }), out), false); // file as folder
+    CHECK_EQ(parseJournal(formatJournal({ pkg, { L'A', L"plugins\\a.dll" }, { L'D', L"plugins" } }), out), false); // folder last
+    CHECK_EQ(parseJournal(formatJournal({ pkg, { L'D', L"plugins" }, { L'D', L"PLUGINS" } }), out), false);  // folder twice
+
+    std::vector<JournalEntry> many = { pkg };
+    for (int k = 0; k < 5000; k++) {
+        many.push_back({ L'A', L"f" + std::to_wstring(k) + L".dll" });
+    }
+    CHECK_EQ(parseJournal(formatJournal(many), out), false);                                       // far too long
+
+    CHECK_EQ(parseJournal(formatJournal({ pkg, { L'D', L"plugins" }, { L'D', L"plugins\\sub" },
+                                          { L'A', L"plugins\\sub\\a.dll" }, { L'R', L"limit-nvpstate.exe" } }), out),
+             true);
+}
+
 } // namespace
 
 int main() {
@@ -450,6 +473,7 @@ int main() {
     reserved_cases();
     phase_roundTrip();
     journal_v2_schema();
+    journal_pathRules();
 
     if (failures == 0) {
         std::printf("all tests passed\n");

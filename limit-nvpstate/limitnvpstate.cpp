@@ -1633,7 +1633,11 @@ void limitnvpstate::finishUpdateLater() {
             outcome->updated = true;
             updatetxn::retire(appDir);
         } else if (present && phase == Phase::RolledBack) {
-            outcome->rolledBack = QString::fromStdWString(updatetxn::readResult(appDir));
+            // Never an undo without a word: the reason may not have been saved.
+            const std::wstring result = updatetxn::readResult(appDir);
+            outcome->rolledBack       = result.empty() ? QStringLiteral("The update was undone; you are on the previous "
+                                                                        "version. The reason could not be saved.")
+                                                       : QString::fromStdWString(result);
             updatetxn::retire(appDir);
         } else if (!present && !updatetxn::hasJournal(appDir)) {
             updatetxn::retire(appDir);   // a download that was never installed
@@ -1838,21 +1842,34 @@ void limitnvpstate::startUpdate(const updater::Release& release) {
             return;
         }
 
-        std::wstring error;
+        // The helper is started, and this copy closes only once the helper
+        // has taken over -- waited for in the background (up to 45 s if
+        // another update holds the lock). If it hasn't, this copy carries on.
+        struct HandOff {
+            bool         ok = false;
+            std::wstring error;
+        };
 
-        if (!updater::launchHelper(appDir, isVisible(), error)) {
-            resumeAfterFailedHandOff(QStringLiteral("The update was not installed.\n\n%1")
-                                         .arg(QString::fromStdWString(error)));
-            return;
-        }
+        const auto handOff = std::make_shared<HandOff>();
+        const bool visible = isVisible();
 
-        beginExit();
+        runInBackground(this, [appDir, visible, handOff]() {
+            handOff->ok = updater::launchHelper(appDir, visible, handOff->error);
+        }, [this, handOff]() {
+            if (!handOff->ok) {
+                resumeAfterFailedHandOff(QStringLiteral("The update was not installed.\n\n%1")
+                                             .arg(QString::fromStdWString(handOff->error)));
+                return;
+            }
 
-        if (trayIcon) {
-            trayIcon->hide();
-        }
+            beginExit();
 
-        QCoreApplication::exit(0);
+            if (trayIcon) {
+                trayIcon->hide();
+            }
+
+            QCoreApplication::exit(0);
+        });
     });
 }
 

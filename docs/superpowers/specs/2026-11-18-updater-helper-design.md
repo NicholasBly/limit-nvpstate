@@ -63,15 +63,23 @@ just exits (an update is running; the helper will start the app).
 2. **App:** copy the package's helper to `limit-nvpstate-update\helper\`
    (inside the work folder, never part of the swap; failure: abort, keep
    running). Stop watching, release the GPU (failure: abort, keep running).
-   Start the helper with an inherited handle to the app's own process (and
-   `--show` if the window is open), then exit.
-3. **Helper:** take the update lock. Wait for the app's process handle to be
-   signalled (anything but `WAIT_OBJECT_0` within 30 s: abort without
-   changes, start the old app again). Plan the install (as today, plus the
-   rules in "Package and journal rules"), write `journal.txt`, set the phase
-   to `swapping`.
+   Start the helper with two inherited handles -- the app's own process and
+   an "accepted" event -- (and `--show` if the window is open). Wait, in the
+   background, until the helper sets "accepted" (it has the lock and found
+   the package), ends, or 45 s pass; only on "accepted" exit. Otherwise stop
+   the helper if it still runs, keep running, and say why (review 4, U4).
+3. **Helper:** take the update lock and find the package; then set
+   "accepted". Wait for the app's process handle to be signalled (anything
+   but `WAIT_OBJECT_0` within 30 s: nothing is changed, the reason is
+   recorded, and the old app is started again once it has closed). Then wait
+   up to 10 s for no copy to own the single-instance mutex (still owned:
+   refuse, nothing changed). Save a copy of `config.json` in the work folder.
+   Plan the install (as today, plus the rules in "Package and journal
+   rules"), write `journal.txt`, set the phase to `swapping`.
 4. **Helper, each file:** back up the current one (hard link into
-   `backup\`, or a copy where hard links aren't supported), then rename the
+   `backup\`, or where hard links aren't supported a copy made in `copying\`,
+   flushed, then renamed into `backup\` -- a backup under its real name is
+   always whole), then rename the
    new file over it (`MoveFileEx REPLACE_EXISTING | WRITE_THROUGH`). The
    target always exists: old, then new.
 5. **Helper:** phase `verifying`. Start the new exe with
@@ -81,8 +89,9 @@ just exits (an update is running; the helper will start the app).
    the event only from inside its running event loop, at least 0.5 s after
    `init()` returned, and only if no fatal error is pending (T2).
 6. **Helper:** success = the event is set within 30 s **and** the new
-   process is still running 3 s later. Then phase `committed`, release the
-   lock, exit.
+   process is still running 3 s later, and still running right before each
+   try at writing phase `committed` (up to 5 tries). Then release the lock,
+   exit.
    Failure (exited, timed out, or died in the grace period): stop it and
    require `WAIT_OBJECT_0` (T7) — if it can't be confirmed gone, leave
    everything as is, phase stays, record "restart Windows to finish", exit.
@@ -108,13 +117,21 @@ A normal start that finds the lock free and the work folder with a phase of
 `swapping`, `verifying` or `rolling-back` (the helper died) does not start
 the limiter: it starts the helper in `recover` mode and exits (T6). The
 helper undoes, sets `rolled-back`, records "an update was interrupted",
-starts the app. Phase file unreadable, or journal invalid → "needs repair":
-nothing is changed or deleted, the app says where the backups are, and
-further updates are refused until it is resolved.
+starts the app. Phase file unreadable, journal invalid, or an undo that
+couldn't finish → "needs repair": nothing is changed or deleted, and the app
+fails closed -- a plain Windows message says where the backups are and what
+to do, and the app exits before reading the config or touching the GPU (a
+half-undone install never runs as the GPU manager). The next start by hand
+tries the undo again (review 4, U3). The same holds when the helper that
+should undo it doesn't take over.
 
 If the app itself can't start, running `limit-nvpstate-updater.exe` (next to
 the exe, or the copy in `limit-nvpstate-update\helper\`) with no arguments
-does the same recovery. Every file is always present (step 4), and Qt is the
+does the same recovery -- also when `limit-nvpstate.exe` itself is missing:
+the helper finds the program folder from its own location (review 4, U1).
+Undo never moves an ordinary file aside to put the old one back (a crash in
+between would leave none); only the helper's own running exe is, and it is
+put back if the second step fails. Every file is always present (step 4), and Qt is the
 same version in every release, so this should not be needed.
 
 ## Package and journal rules (T9, T11)
@@ -145,9 +162,16 @@ nothing needs to stay compatible with it.
 - Power cut during step 4: a mix of old and new files, all present; the app
   starts (same Qt) and the helper undoes. If a future release changes the Qt
   version, a mixed state might not start; the helper by hand still recovers.
-- The checksum still comes from the same release as the zip (T10).
+- The checksum still comes from the same release as the zip (T10): it
+  catches a damaged download, not a harmful release. Whoever can publish a
+  release on the GitHub account can ship code that runs as administrator
+  (the new version runs elevated while it is checked, whichever helper did
+  the swap). The README says so plainly; releases are not signed (review 4,
+  U11, the user's choice).
 - `tar.exe` still does the unpacking; the zip's list is checked before it
-  runs and the result after.
+  runs and the result after: the same names, the same sizes, nothing beside
+  the package folder, and the size limits before the new helper is copied
+  (review 4, U6). It doesn't limit what tar writes while it runs.
 - During the swap (a few seconds) no process manages the GPU (unlimited).
 
 ## Builder's calls
@@ -160,3 +184,14 @@ nothing needs to stay compatible with it.
   app keeps network/prepare in `updater`.
 - Timeouts: helper waits 30 s for the old app, 30 s for "up", 3 s grace.
 - Test builds get pause/fault switches in the helper too (testhooks.h).
+
+## Start order (review 4, U2)
+
+The app takes the single-instance mutex **first**, then checks the update
+lock; a normal start that finds the lock held exits. The helper takes the
+lock before it sets "accepted", so before the old app closes and lets go of
+the mutex: any copy that gets the mutex later sees the lock. The new version
+the helper starts (`--after-update`) skips the lock check and retries the
+mutex for up to 5 s, in case a copy started by hand holds it for the moment
+it takes to give way. Manual recovery takes the lock before it checks for a
+running copy.

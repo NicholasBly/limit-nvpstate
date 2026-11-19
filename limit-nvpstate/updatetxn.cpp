@@ -11,6 +11,7 @@ namespace {
 
 const wchar_t WORK_DIR_NAME[] = L"limit-nvpstate-update";
 const wchar_t TOMBSTONE[]     = L"limit-nvpstate-update.done-";
+const wchar_t BUILDING[]      = L"limit-nvpstate-update.new-";   // a work folder being set up
 const wchar_t OWNER_FILE[]    = L"owner.txt";
 const wchar_t JOURNAL_FILE[]  = L"journal.txt";
 const wchar_t PHASE_FILE[]    = L"phase.txt";
@@ -18,8 +19,46 @@ const wchar_t PHASE_TMP[]     = L"phase.tmp";
 const wchar_t RESULT_FILE[]   = L"result.txt";
 const wchar_t UPDATE_LOCK[]   = L"Local\\limit-nvpstate-update";
 const wchar_t HELPER_NAME[]   = L"limit-nvpstate-updater.exe";
+const wchar_t COPYING_DIR[]   = L"copying";   // backups being copied (never read by undo)
+const wchar_t SAVED_CONFIG[]  = L"config-before-update.json";
 const int     RETIRE_TRIES    = 20;    // renaming the work folder...
 const DWORD   RETIRE_RETRY_MS = 250;   // ...this far apart: about 5 s
+
+// Test only: true for the first N calls with this variable set to N.
+bool testFailsTimes(const wchar_t* variable) {
+    static std::atomic<unsigned> used{ 0 };
+    const unsigned               times = testValue(variable, 0);
+
+    if (used < times) {
+        used++;
+        SetLastError(ERROR_WRITE_FAULT);
+        return true;
+    }
+
+    return false;
+}
+
+// Test only: writes half of `from` to `to`, then this process dies -- a crash
+// or power cut in the middle of a copy. Never returns when it fires.
+bool testDieInCopy(const std::wstring& from, const std::wstring& to, const std::wstring& name) {
+    if (!testFails(L"LIMITNV_TEST_DIE_IN_BACKUP_COPY", name)) {
+        return false;
+    }
+
+    CopyFileW(from.c_str(), to.c_str(), TRUE);
+    HANDLE        file = CreateFileW(to.c_str(), GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    LARGE_INTEGER size = {};
+
+    if (file != INVALID_HANDLE_VALUE && GetFileSizeEx(file, &size)) {
+        size.QuadPart /= 2;
+        SetFilePointerEx(file, size, nullptr, FILE_BEGIN);
+        SetEndOfFile(file);
+        CloseHandle(file);
+    }
+
+    TerminateProcess(GetCurrentProcess(), 9);
+    return true;
+}
 
 bool sameName(const std::wstring& a, const wchar_t* b) {
     return CompareStringOrdinal(a.c_str(), -1, b, -1, TRUE) == CSTR_EQUAL;
@@ -136,21 +175,27 @@ bool removeTombstone(const std::wstring& dir) {
         }
 
         // Only the marker left? Then it goes, then the folder.
-        bool onlyMarker = true;
-        find            = FindFirstFileW((dir + L"\\*").c_str(), &data);
+        // Only a complete listing counts: the marker is what lets a later
+        // run recognise this folder, so it is never removed on a guess.
+        bool onlyMarker = false;
+        find            = testFails(L"LIMITNV_TEST_FAIL_TOMBSTONE_LIST", L"1")
+                            ? INVALID_HANDLE_VALUE
+                            : FindFirstFileW((dir + L"\\*").c_str(), &data);
 
         if (find != INVALID_HANDLE_VALUE) {
+            onlyMarker = true;
+
             do {
                 const std::wstring name = data.cFileName;
                 onlyMarker &= name == L"." || name == L".." || sameName(name, OWNER_FILE);
             } while (FindNextFileW(find, &data));
 
+            onlyMarker &= GetLastError() == ERROR_NO_MORE_FILES;
             FindClose(find);
         }
 
-        if (onlyMarker) {
-            DeleteFileW(marker.c_str());
-            RemoveDirectoryW(dir.c_str());
+        if (onlyMarker && DeleteFileW(marker.c_str()) && !RemoveDirectoryW(dir.c_str())) {
+            writeTextFile(marker, L"limit-nvpstate updater\n", CREATE_NEW);   // still there: keep it recognisable
         }
 
         if (probe(dir) == PathState::Missing) {
@@ -161,65 +206,82 @@ bool removeTombstone(const std::wstring& dir) {
     return false;
 }
 
-// True if both names are the same file (a hard link), or two files with the
-// same bytes. Opening for attributes only works even on a file another
-// program holds open.
-bool sameFile(const std::wstring& a, const std::wstring& b) {
-    const auto identity = [](const std::wstring& path, BY_HANDLE_FILE_INFORMATION& info) {
-        HANDLE file = CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                                  nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+bool fileIdentity(const std::wstring& path, BY_HANDLE_FILE_INFORMATION& info) {
+    // Opening for attributes only works even on a file another program holds open.
+    HANDLE file = CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                              nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
 
-        if (file == INVALID_HANDLE_VALUE) {
-            return false;
-        }
+    if (file == INVALID_HANDLE_VALUE) {
+        return false;
+    }
 
-        const bool ok = GetFileInformationByHandle(file, &info) != FALSE;
-        CloseHandle(file);
-        return ok;
-    };
+    const bool ok = GetFileInformationByHandle(file, &info) != FALSE;
+    CloseHandle(file);
+    return ok;
+}
 
+bool sameIdentity(const BY_HANDLE_FILE_INFORMATION& x, const BY_HANDLE_FILE_INFORMATION& y) {
+    return x.dwVolumeSerialNumber == y.dwVolumeSerialNumber && x.nFileIndexHigh == y.nFileIndexHigh
+        && x.nFileIndexLow == y.nFileIndexLow;
+}
+
+enum class Sameness { Same, Different, Unknown };
+
+// Same: one file under two names (a hard link), or two files with the same
+// bytes. Unknown when either can't be examined -- never taken as different.
+Sameness compareFiles(const std::wstring& a, const std::wstring& b) {
     BY_HANDLE_FILE_INFORMATION x = {};
     BY_HANDLE_FILE_INFORMATION y = {};
 
-    if (!identity(a, x) || !identity(b, y)) {
-        return false;
+    if (!fileIdentity(a, x) || !fileIdentity(b, y)) {
+        return Sameness::Unknown;
     }
 
-    if (x.dwVolumeSerialNumber == y.dwVolumeSerialNumber && x.nFileIndexHigh == y.nFileIndexHigh
-        && x.nFileIndexLow == y.nFileIndexLow) {
-        return true;
+    if (sameIdentity(x, y)) {
+        return Sameness::Same;
     }
 
     if (x.nFileSizeHigh != y.nFileSizeHigh || x.nFileSizeLow != y.nFileSizeLow) {
-        return false;
+        return Sameness::Different;
     }
 
     HANDLE fa = CreateFileW(a.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
                             OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
     HANDLE fb = CreateFileW(b.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
                             OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
-    bool same = fa != INVALID_HANDLE_VALUE && fb != INVALID_HANDLE_VALUE;
+    Sameness result = fa != INVALID_HANDLE_VALUE && fb != INVALID_HANDLE_VALUE ? Sameness::Same : Sameness::Unknown;
 
     std::vector<char> ba(64 * 1024);
     std::vector<char> bb(64 * 1024);
 
-    while (same) {
+    while (result == Sameness::Same) {
         DWORD ra = 0;
         DWORD rb = 0;
 
         if (!ReadFile(fa, ba.data(), static_cast<DWORD>(ba.size()), &ra, nullptr)
-            || !ReadFile(fb, bb.data(), static_cast<DWORD>(bb.size()), &rb, nullptr) || ra != rb) {
-            same = false;
+            || !ReadFile(fb, bb.data(), static_cast<DWORD>(bb.size()), &rb, nullptr)) {
+            result = Sameness::Unknown;
+        } else if (ra != rb || !std::equal(ba.begin(), ba.begin() + ra, bb.begin())) {
+            result = Sameness::Different;
         } else if (ra == 0) {
             break;
-        } else {
-            same = std::equal(ba.begin(), ba.begin() + ra, bb.begin());
         }
     }
 
     if (fa != INVALID_HANDLE_VALUE) CloseHandle(fa);
     if (fb != INVALID_HANDLE_VALUE) CloseHandle(fb);
-    return same;
+    return result;
+}
+
+// True if `path` is the exe of this very process (a helper run by hand from
+// the program folder): the one program file that can be in use during undo.
+bool isOwnImage(const std::wstring& path) {
+    wchar_t     own[MAX_PATH];
+    const DWORD n = GetModuleFileNameW(nullptr, own, MAX_PATH);
+
+    BY_HANDLE_FILE_INFORMATION x = {};
+    BY_HANDLE_FILE_INFORMATION y = {};
+    return n > 0 && n < MAX_PATH && fileIdentity(own, x) && fileIdentity(path, y) && sameIdentity(x, y);
 }
 
 bool isUnder(const std::wstring& path, const std::wstring& folder) {
@@ -486,7 +548,18 @@ bool openWorkDir(const std::wstring& appDir, std::wstring& error) {
             return false;
         }
 
-        if (hasJournal(appDir)) {
+        // Still open (no outcome recorded): the next start's to undo. One
+        // that finished (installed, or undone) only wasn't set aside yet --
+        // a locked file at the time -- so it is now.
+        using updaterules::Phase;
+
+        Phase        phase    = Phase::Swapping;
+        bool         recorded = false;
+        std::wstring phaseError;
+        const bool   finished = readPhase(appDir, phase, recorded, phaseError) && recorded
+                           && (phase == Phase::Committed || phase == Phase::RolledBack);
+
+        if (hasJournal(appDir) && !finished) {
             error = L"An earlier update has not finished. Restart limit-nvpstate, then try again";
             return false;
         }
@@ -500,18 +573,28 @@ bool openWorkDir(const std::wstring& appDir, std::wstring& error) {
         }
     }
 
-    // Inherits the program folder's permissions: no easier to change than
-    // the exe next to it.
-    if (!CreateDirectoryW(dir.c_str(), nullptr)) {
-        error = errorText(L"Could not create the updater's folder", GetLastError());
+    // Built under another name, then renamed into place in one step: under
+    // its real name the folder always has its marker, so a failure halfway
+    // can't leave a folder that blocks every later update. Inherits the
+    // program folder's permissions: no easier to change than the exe next to it.
+    const std::wstring building = appDir + L"\\" + BUILDING + std::to_wstring(GetTickCount64()) + L"-"
+                                + std::to_wstring(GetCurrentProcessId());
+    const auto         failed   = [&](const wchar_t* what) {
+        const DWORD code = GetLastError();
+        removeTree(building);
+        error = errorText(what, code);
         return false;
+    };
+
+    if (!CreateDirectoryW(building.c_str(), nullptr)) {
+        return failed(L"Could not create the updater's folder");
     }
 
-    if (probe(dir) != PathState::Directory
-        || !writeTextFile(workFile(appDir, OWNER_FILE), L"limit-nvpstate updater\n", CREATE_NEW)
-        || !CreateDirectoryW(downloadDir(appDir).c_str(), nullptr)) {
-        error = errorText(L"Could not set up the updater's folder", GetLastError());
-        return false;
+    if (probe(building) != PathState::Directory || testFailsTimes(L"LIMITNV_TEST_FAIL_OWNER_TIMES")
+        || !writeTextFile(building + L"\\" + OWNER_FILE, L"limit-nvpstate updater\n", CREATE_NEW)
+        || !CreateDirectoryW((building + downloadDir(appDir).substr(dir.size())).c_str(), nullptr)
+        || !MoveFileExW(building.c_str(), dir.c_str(), 0)) {
+        return failed(L"Could not set up the updater's folder");
     }
 
     return true;
@@ -553,7 +636,9 @@ bool updateLockHeld() {
     HANDLE lock = OpenMutexW(SYNCHRONIZE | MUTEX_MODIFY_STATE, FALSE, UPDATE_LOCK);
 
     if (!lock) {
-        return false;   // nobody has created it: nobody holds it
+        // Nobody has created it: nobody holds it. Anything else (denied, an
+        // error) counts as held -- the cautious answer.
+        return GetLastError() != ERROR_FILE_NOT_FOUND;
     }
 
     const DWORD waited = WaitForSingleObject(lock, 0);
@@ -604,6 +689,10 @@ bool writePhase(const std::wstring& appDir, updaterules::Phase phase, std::wstri
 }
 
 bool writeResult(const std::wstring& appDir, const std::wstring& text) {
+    if (testFails(L"LIMITNV_TEST_FAIL_RESULT", L"1")) {
+        return false;
+    }
+
     return writeTextFile(workFile(appDir, RESULT_FILE), text, CREATE_ALWAYS);
 }
 
@@ -764,6 +853,20 @@ SwapResult swapIn(const std::wstring& packageDir, const std::wstring& appDir, st
         }
     }
 
+    testPause(L"LIMITNV_TEST_PAUSE_BEFORE_JOURNAL");   // test only: the old version is gone, nothing written yet
+
+    // ---- your settings as they are now: the new version may change them
+    // while it is being checked, and an undo puts them back with the files.
+    const std::wstring config      = appDir + L"\\config.json";
+    const std::wstring savedConfig = workFile(appDir, SAVED_CONFIG);
+
+    if (probe(config) == PathState::File
+        && (!CopyFileW(config.c_str(), savedConfig.c_str(), TRUE) || !flushToDisk(savedConfig))) {
+        error = errorText(L"Could not save a copy of your settings", GetLastError());
+        DeleteFileW(savedConfig.c_str());
+        return SwapResult::RolledBack;
+    }
+
     // ---- the plan and the phase reach the disk before any program file
     if (!writeTextFile(workFile(appDir, JOURNAL_FILE), updaterules::formatJournal(plan), CREATE_NEW)) {
         error = errorText(L"Could not write the update journal", GetLastError());
@@ -826,10 +929,25 @@ SwapResult swapIn(const std::wstring& packageDir, const std::wstring& appDir, st
                 return fail(L"Could not create the backup folder for " + step.path);
             }
 
-            // A copy is new data: on the disk before the old file is replaced.
-            if (!CreateHardLinkW(backup.c_str(), target.c_str(), nullptr)
-                && (!CopyFileW(target.c_str(), backup.c_str(), TRUE) || !flushToDisk(backup))) {
-                return fail(L"Could not back up " + step.path);
+            // Where hard links aren't supported (FAT32, exFAT) the backup is a
+            // copy, made under another name and renamed into place only once
+            // it is complete and on the disk: a backup under its real name is
+            // always a whole file, so a cut-off copy is never put back.
+            if (testFails(L"LIMITNV_TEST_NO_HARDLINK", L"1") || !CreateHardLinkW(backup.c_str(), target.c_str(), nullptr)) {
+                const std::wstring copyDir = work + L"\\" + COPYING_DIR;
+                const std::wstring copying = copyDir + L"\\" + step.path;
+
+                if ((!directoryExists(copyDir) && !CreateDirectoryW(copyDir.c_str(), nullptr))
+                    || !makeDirectories(copyDir, step.path)) {
+                    return fail(L"Could not create the backup folder for " + step.path);
+                }
+
+                DeleteFileW(copying.c_str());
+
+                if (testDieInCopy(target, copying, step.path) || !CopyFileW(target.c_str(), copying.c_str(), TRUE)
+                    || !flushToDisk(copying) || !MoveFileExW(copying.c_str(), backup.c_str(), MOVEFILE_WRITE_THROUGH)) {
+                    return fail(L"Could not back up " + step.path);
+                }
             }
 
             if (!MoveFileExW(source.c_str(), target.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
@@ -891,26 +1009,65 @@ bool undo(const std::wstring& appDir, std::wstring& error) {
                 continue;
             }
 
-            // Backed up but never replaced (the swap stopped between the two):
-            // the target is still the previous file -- the very same one, for
-            // a hard-link backup. Nothing to put back.
-            if (probe(target) == PathState::File && sameFile(backup, target)) {
+            const PathState now = probe(target);
+
+            if (now == PathState::File) {
+                // Backed up but never replaced (the swap stopped between the
+                // two): the target is still the previous file -- the very
+                // same one, for a hard-link backup. Nothing to put back. If
+                // that can't be told, nothing is overwritten.
+                const Sameness same = compareFiles(backup, target);
+
+                if (same == Sameness::Same) {
+                    continue;
+                }
+
+                if (same == Sameness::Unknown) {
+                    failed += L"\n" + it->path;
+                    continue;
+                }
+            } else if (now != PathState::Missing) {
+                failed += L"\n" + it->path;   // a folder, a link, or can't be examined
                 continue;
             }
 
-            // One rename puts the old file back. If the new one is in use
-            // (a copy of the helper run by hand), move it aside first.
-            if (!MoveFileExW(backup.c_str(), target.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-                const std::wstring trash = freeTrashName(appDir);
+            // One rename puts the old file back; the target is never missing.
+            if (testFails(L"LIMITNV_TEST_FAIL_RESTORE_REPLACE", it->path)
+                || !MoveFileExW(backup.c_str(), target.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+                // A running exe can be renamed but not replaced, and the only
+                // program file running now can be this helper (run by hand
+                // from the program folder). Only that one is moved aside
+                // first; anything else stays as it is and is tried again
+                // later -- moving it aside could leave no file at all if this
+                // stopped halfway.
+                const std::wstring trash = now == PathState::File && isOwnImage(target) ? freeTrashName(appDir)
+                                                                                        : std::wstring();
 
-                if (trash.empty() || !MoveFileExW(target.c_str(), trash.c_str(), MOVEFILE_WRITE_THROUGH)
-                    || !MoveFileExW(backup.c_str(), target.c_str(), MOVEFILE_WRITE_THROUGH)) {
+                if (trash.empty() || !MoveFileExW(target.c_str(), trash.c_str(), MOVEFILE_WRITE_THROUGH)) {
+                    failed += L"\n" + it->path;
+                    continue;
+                }
+
+                testPause(L"LIMITNV_TEST_PAUSE_RESTORE_ASIDE");
+
+                if (!MoveFileExW(backup.c_str(), target.c_str(), MOVEFILE_WRITE_THROUGH)) {
+                    MoveFileExW(trash.c_str(), target.c_str(), MOVEFILE_WRITE_THROUGH);   // as it was
                     failed += L"\n" + it->path;
                 }
             }
         } else if (it->kind == L'D') {
             RemoveDirectoryW(target.c_str());   // only if empty; fine if not
         }
+    }
+
+    // Your settings as they were before the update. Moved, not copied: one
+    // step, and once it's done a repeated undo has nothing more to do here.
+    const std::wstring savedConfig = workFile(appDir, SAVED_CONFIG);
+
+    if (probe(savedConfig) == PathState::File
+        && !MoveFileExW(savedConfig.c_str(), (appDir + L"\\config.json").c_str(),
+                        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        failed += L"\nconfig.json";
     }
 
     if (!failed.empty()) {
@@ -968,25 +1125,33 @@ bool retire(const std::wstring& appDir) {
 }
 
 void deleteTombstones(const std::wstring& appDir) {
-    WIN32_FIND_DATAW data;
-    HANDLE           find = FindFirstFileW((appDir + L"\\" + TOMBSTONE + L"*").c_str(), &data);
-
-    if (find == INVALID_HANDLE_VALUE) {
-        return;
-    }
-
     std::vector<std::wstring> found;
 
-    do {
-        const std::wstring dir = appDir + L"\\" + data.cFileName;
+    // Finished work folders, and any left by a crash while one was being set
+    // up. Only folders with the marker are ours; an empty one being set up
+    // (a crash right after it was created) goes too.
+    for (const wchar_t* prefix : { TOMBSTONE, BUILDING }) {
+        WIN32_FIND_DATAW data;
+        HANDLE           find = FindFirstFileW((appDir + L"\\" + prefix + L"*").c_str(), &data);
 
-        if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && !(data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)
-            && fileExists(dir + L"\\" + OWNER_FILE)) {
-            found.push_back(dir);
+        if (find == INVALID_HANDLE_VALUE) {
+            continue;
         }
-    } while (FindNextFileW(find, &data));
 
-    FindClose(find);
+        do {
+            const std::wstring dir = appDir + L"\\" + data.cFileName;
+
+            if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && !(data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
+                if (fileExists(dir + L"\\" + OWNER_FILE)) {
+                    found.push_back(dir);
+                } else if (prefix == BUILDING) {
+                    RemoveDirectoryW(dir.c_str());   // only if empty
+                }
+            }
+        } while (FindNextFileW(find, &data));
+
+        FindClose(find);
+    }
 
     for (const std::wstring& dir : found) {
         removeTombstone(dir);

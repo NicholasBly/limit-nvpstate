@@ -41,14 +41,36 @@ constexpr DWORD READY_MS     = 30000;   // the new version to say it is up
 constexpr DWORD GRACE_MS     = 3000;    // ...and still be running after that
 constexpr DWORD TERMINATE_MS = 10000;   // a stopped new version to be gone
 constexpr DWORD LOCK_MS      = 30000;
+constexpr DWORD APP_GONE_MS  = 10000;   // no other copy may be running
 constexpr int   COMMIT_TRIES    = 5;     // writing "committed"...
 constexpr DWORD COMMIT_RETRY_MS = 200;   // ...this far apart
 
+// Exit codes. The program reads the ones from before the helper took over.
+constexpr int EXIT_OK          = 0;
+constexpr int EXIT_REFUSED     = 1;
+constexpr int EXIT_NEEDS_REPAIR = 2;
+constexpr int EXIT_BUSY        = 3;   // another update holds the lock
+constexpr int EXIT_NO_PACKAGE  = 4;   // the reason is in result.txt
+
 struct Options {
     enum class Mode { Install, Recover, Invalid } mode = Mode::Invalid;
-    HANDLE waitFor = nullptr;   // the process to wait for before touching files
-    bool   show    = false;
+    HANDLE waitFor  = nullptr;   // the process to wait for before touching files
+    HANDLE accepted = nullptr;   // set once this helper has taken over
+    bool   show     = false;
 };
+
+HANDLE inheritedEvent(const wchar_t* text) {
+    wchar_t*                 end   = nullptr;
+    const unsigned long long value = wcstoull(text, &end, 10);
+    DWORD                    flags = 0;
+
+    if (!end || *end != L'\0' || value == 0) {
+        return nullptr;
+    }
+
+    const HANDLE handle = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(value));
+    return GetHandleInformation(handle, &flags) && WaitForSingleObject(handle, 0) != WAIT_FAILED ? handle : nullptr;
+}
 
 HANDLE inheritedProcess(const wchar_t* text) {
     wchar_t*                 end   = nullptr;
@@ -87,6 +109,12 @@ Options parseOptions() {
             if (!options.waitFor) {
                 options.mode = Options::Mode::Invalid;
             }
+        } else if (i == 3 && options.waitFor) {
+            options.accepted = inheritedEvent(args[i]);
+
+            if (!options.accepted) {
+                options.mode = Options::Mode::Invalid;
+            }
         } else {
             options.mode = Options::Mode::Invalid;
         }
@@ -94,7 +122,7 @@ Options parseOptions() {
 
     LocalFree(args);
 
-    if (options.mode == Options::Mode::Install && !options.waitFor) {
+    if (options.mode == Options::Mode::Install && (!options.waitFor || !options.accepted)) {
         options.mode = Options::Mode::Invalid;   // install always comes from the app
     }
 
@@ -123,7 +151,10 @@ std::wstring findAppDir() {
         dir = parentOf(parentOf(dir));
     }
 
-    return updatetxn::fileExists(dir + L"\\limit-nvpstate.exe") ? dir : std::wstring();
+    // Not "where limit-nvpstate.exe is": recovery is exactly for when it may
+    // be missing (an interrupted undo, a virus scanner). recover() checks the
+    // updater's own folder and journal instead.
+    return dir;
 }
 
 // Starts limit-nvpstate. `ready` (optional) is the one handle it inherits.
@@ -210,23 +241,104 @@ int rollBack(const std::wstring& appDir, const std::wstring& reason) {
     std::wstring error;
     std::wstring phaseError;
 
-    if (updatetxn::undo(appDir, error) && updatetxn::writePhase(appDir, Phase::RolledBack, phaseError)) {
+    // The reason is written before the outcome it explains: the program
+    // shows the reason when it finds the outcome.
+    if (updatetxn::undo(appDir, error)) {
         updatetxn::writeResult(appDir, reason + L"\n\nThe update was undone; you are on the previous version.");
-        return 0;
+
+        if (updatetxn::writePhase(appDir, Phase::RolledBack, phaseError)) {
+            return EXIT_OK;
+        }
+
+        error = phaseError;
     }
 
-    updatetxn::writePhase(appDir, Phase::NeedsRepair, phaseError);
     updatetxn::writeResult(appDir, reason + L"\n\nThe update could not be fully undone.\n\n" + error);
-    return 2;
+    updatetxn::writePhase(appDir, Phase::NeedsRepair, phaseError);
+    return EXIT_NEEDS_REPAIR;
 }
 
-int install(const std::wstring& appDir, HANDLE oldApp, bool show) {
+// A copy owns the single-instance mutex. Anything that can't be checked
+// counts as running.
+bool appRunning() {
+    HANDLE instance = OpenMutexW(SYNCHRONIZE, FALSE, L"Local\\limit-nvpstate");
+
+    if (!instance) {
+        return GetLastError() != ERROR_FILE_NOT_FOUND;
+    }
+
+    const DWORD waited = WaitForSingleObject(instance, 0);
+
+    if (waited == WAIT_OBJECT_0 || waited == WAIT_ABANDONED) {
+        ReleaseMutex(instance);
+    }
+
+    CloseHandle(instance);
+    return waited != WAIT_OBJECT_0 && waited != WAIT_ABANDONED;
+}
+
+// Called holding the update lock. A copy that starts now takes the mutex
+// first and then sees the lock, so it gives way in a moment; this waits for
+// that, and for nothing longer.
+bool waitForNoApp(DWORD ms) {
+    for (DWORD waited = 0;; waited += 100) {
+        if (!appRunning()) {
+            return true;
+        }
+
+        if (waited >= ms) {
+            return false;
+        }
+
+        Sleep(100);
+    }
+}
+
+// From here on this helper owns the update; the program may close.
+void acknowledge(HANDLE& accepted) {
+    if (accepted) {
+        SetEvent(accepted);
+        CloseHandle(accepted);
+        accepted = nullptr;
+    }
+}
+
+void closeIfSet(HANDLE& handle) {
+    if (handle) {
+        CloseHandle(handle);
+        handle = nullptr;
+    }
+}
+
+int install(const std::wstring& appDir, HANDLE oldApp, HANDLE accepted, bool show) {
+    if (testFails(L"LIMITNV_TEST_HELPER_EXIT_EARLY", L"install")) {
+        CloseHandle(oldApp);
+        closeIfSet(accepted);
+        return EXIT_REFUSED;   // test only: the helper dies right after it starts
+    }
+
+    // ---- before taking over: on any problem the program is still running,
+    // and keeps running (it sees this process end without "accepted").
     HANDLE lock = updatetxn::takeUpdateLock(LOCK_MS);
 
     if (!lock) {
         CloseHandle(oldApp);
-        return 1;
+        closeIfSet(accepted);
+        return EXIT_BUSY;
     }
+
+    std::wstring packageDir;
+    std::wstring error;
+
+    if (!updatetxn::findPackage(appDir, packageDir, error)) {
+        updatetxn::writeResult(appDir, L"The update could not be installed, so nothing was changed.\n\n" + error);
+        updatetxn::releaseUpdateLock(lock);
+        CloseHandle(oldApp);
+        closeIfSet(accepted);
+        return EXIT_NO_PACKAGE;
+    }
+
+    acknowledge(accepted);
 
     // Nothing is touched until the old version is really gone: its exe and
     // DLLs are in use until then.
@@ -237,9 +349,9 @@ int install(const std::wstring& appDir, HANDLE oldApp, bool show) {
         // once it is gone it is started again -- otherwise nothing would be
         // running. The lock is let go first: it would block a start by hand.
         std::wstring phaseError;
-        updatetxn::writePhase(appDir, Phase::RolledBack, phaseError);
         updatetxn::writeResult(appDir, L"The previous version took too long to close, so the update was not "
                                        L"installed. Nothing was changed.");
+        updatetxn::writePhase(appDir, Phase::RolledBack, phaseError);
         updatetxn::releaseUpdateLock(lock);
         WaitForSingleObject(oldApp, INFINITE);
         CloseHandle(oldApp);
@@ -249,16 +361,15 @@ int install(const std::wstring& appDir, HANDLE oldApp, bool show) {
 
     CloseHandle(oldApp);
 
-    std::wstring packageDir;
-    std::wstring error;
-
-    if (!updatetxn::findPackage(appDir, packageDir, error)) {
+    // No other copy may be running while the files change: it would hold
+    // them open, or run on a mix of old and new files.
+    if (!waitForNoApp(APP_GONE_MS)) {
         std::wstring phaseError;
+        updatetxn::writeResult(appDir, L"Another copy of limit-nvpstate was running, so the update was not "
+                                       L"installed. Nothing was changed.");
         updatetxn::writePhase(appDir, Phase::RolledBack, phaseError);
-        updatetxn::writeResult(appDir, L"The update could not be installed, so nothing was changed.\n\n" + error);
         updatetxn::releaseUpdateLock(lock);
-        restartApp(appDir, show);
-        return 0;
+        return EXIT_REFUSED;   // that copy is the GPU manager; nothing to start
     }
 
     const updatetxn::SwapResult swapped = updatetxn::swapIn(packageDir, appDir, error);
@@ -269,8 +380,8 @@ int install(const std::wstring& appDir, HANDLE oldApp, bool show) {
         if (swapped == updatetxn::SwapResult::RolledBack) {
             // Also when it failed before writing anything: the program must
             // still learn why (a phase is what it looks for).
-            updatetxn::writePhase(appDir, Phase::RolledBack, phaseError);
             updatetxn::writeResult(appDir, L"The update could not be installed, so nothing was changed.\n\n" + error);
+            updatetxn::writePhase(appDir, Phase::RolledBack, phaseError);
         } else {
             updatetxn::writeResult(appDir, L"The update could not be installed, and the previous version could not "
                                            L"be fully put back.\n\n" + error);
@@ -278,7 +389,7 @@ int install(const std::wstring& appDir, HANDLE oldApp, bool show) {
 
         updatetxn::releaseUpdateLock(lock);
         restartApp(appDir, show);
-        return swapped == updatetxn::SwapResult::RolledBack ? 0 : 2;
+        return swapped == updatetxn::SwapResult::RolledBack ? EXIT_OK : EXIT_NEEDS_REPAIR;
     }
 
     // ---- start the new version and check it is healthy
@@ -309,12 +420,29 @@ int install(const std::wstring& appDir, HANDLE oldApp, bool show) {
 
                     // A brief lock on phase.txt (a virus scanner) must not
                     // undo a working update.
-                    for (int attempt = 0; attempt < COMMIT_TRIES && !committed; attempt++) {
+                    bool         died      = false;
+
+                    for (int attempt = 0; attempt < COMMIT_TRIES && !committed && !died; attempt++) {
                         if (attempt > 0) {
                             Sleep(COMMIT_RETRY_MS);
                         }
 
-                        if (testFails(L"LIMITNV_TEST_FAIL_COMMIT", L"1")) {
+                        // Test only: the new version dies between two tries.
+                        if (attempt + 1 == static_cast<int>(testValue(L"LIMITNV_TEST_KILL_CHILD_AT_COMMIT_TRY", 0))) {
+                            TerminateProcess(child, 7);
+                            WaitForSingleObject(child, 5000);
+                        }
+
+                        // Recorded as done only while it is running: one that
+                        // died meanwhile is undone, not committed with nothing
+                        // running.
+                        if (WaitForSingleObject(child, 0) != WAIT_TIMEOUT) {
+                            died = true;
+                            break;
+                        }
+
+                        if (testFails(L"LIMITNV_TEST_FAIL_COMMIT", L"1")
+                            || attempt < static_cast<int>(testValue(L"LIMITNV_TEST_FAIL_COMMIT_TIMES", 0))) {
                             phaseError = L"injected failure";
                         } else {
                             committed = updatetxn::writePhase(appDir, Phase::Committed, phaseError);
@@ -325,13 +453,17 @@ int install(const std::wstring& appDir, HANDLE oldApp, bool show) {
                         CloseHandle(child);
                         CloseHandle(ready);
                         updatetxn::releaseUpdateLock(lock);
-                        return 0;
+                        return EXIT_OK;
                     }
 
-                    // Left as "verifying", the next start would undo it
-                    // anyway -- maybe days later, with no reason given.
-                    reason = L"The new version started fine, but the update could not be recorded (" + phaseError +
-                             L"), so it was undone to keep things consistent.";
+                    if (died) {
+                        reason = L"The new version stopped right after starting (exit code " + exitCodeText(child) + L").";
+                    } else {
+                        // Left as "verifying", the next start would undo it
+                        // anyway -- maybe days later, with no reason given.
+                        reason = L"The new version started fine, but the update could not be recorded (" + phaseError +
+                                 L"), so it was undone to keep things consistent.";
+                    }
                 } else {
                     reason = L"The new version stopped right after starting (exit code " + exitCodeText(child) + L").";
                 }
@@ -368,7 +500,7 @@ int install(const std::wstring& appDir, HANDLE oldApp, bool show) {
                 updatetxn::writeResult(appDir, text);
                 updatetxn::releaseUpdateLock(lock);   // phase stays "verifying": the next start recovers
                 MessageBoxW(nullptr, text.c_str(), L"limit-nvpstate updater", MB_ICONWARNING | MB_OK);
-                return 2;
+                return EXIT_NEEDS_REPAIR;
             }
         }
 
@@ -383,41 +515,50 @@ int install(const std::wstring& appDir, HANDLE oldApp, bool show) {
     return result;
 }
 
-bool appRunning() {
-    HANDLE instance = OpenMutexW(SYNCHRONIZE, FALSE, L"Local\\limit-nvpstate");
-
-    if (!instance) {
-        return false;
+int recover(const std::wstring& appDir, HANDLE waitFor, HANDLE accepted, bool show) {
+    if (testFails(L"LIMITNV_TEST_HELPER_EXIT_EARLY", L"recover")) {
+        closeIfSet(waitFor);
+        closeIfSet(accepted);
+        return EXIT_REFUSED;   // test only: the helper dies right after it starts
     }
 
-    const DWORD waited = WaitForSingleObject(instance, 0);
+    // The lock first, then the check for a running copy: a copy that starts
+    // after the check sees the lock and gives way.
+    HANDLE lock = updatetxn::takeUpdateLock(LOCK_MS);
 
-    if (waited == WAIT_OBJECT_0 || waited == WAIT_ABANDONED) {
-        ReleaseMutex(instance);
+    if (!lock) {
+        const bool byHand = !waitFor;
+        closeIfSet(waitFor);
+        closeIfSet(accepted);
+
+        if (byHand) {
+            MessageBoxW(nullptr, L"An update is being installed right now. Wait a minute, then try again.",
+                        L"limit-nvpstate updater", MB_ICONINFORMATION | MB_OK);
+        }
+
+        return EXIT_BUSY;
     }
 
-    CloseHandle(instance);
-    return waited == WAIT_TIMEOUT;
-}
+    acknowledge(accepted);
 
-int recover(const std::wstring& appDir, HANDLE waitFor, bool show) {
     if (waitFor) {
         const DWORD closed = WaitForSingleObject(waitFor, OLD_EXIT_MS);
         CloseHandle(waitFor);
 
         if (closed != WAIT_OBJECT_0) {
-            return 1;
+            updatetxn::releaseUpdateLock(lock);
+            MessageBoxW(nullptr, L"limit-nvpstate did not close, so the unfinished update could not be undone. Restart "
+                                 L"Windows, then start limit-nvpstate again.",
+                        L"limit-nvpstate updater", MB_ICONWARNING | MB_OK);
+            return EXIT_REFUSED;
         }
-    } else if (appRunning()) {
-        MessageBoxW(nullptr, L"Close limit-nvpstate (right-click its tray icon, Exit), then run this again.",
-                    L"limit-nvpstate updater", MB_ICONINFORMATION | MB_OK);
-        return 1;
     }
 
-    HANDLE lock = updatetxn::takeUpdateLock(LOCK_MS);
-
-    if (!lock) {
-        return 1;
+    if (!waitForNoApp(waitFor ? APP_GONE_MS : 0)) {
+        updatetxn::releaseUpdateLock(lock);
+        MessageBoxW(nullptr, L"Close limit-nvpstate (right-click its tray icon, Exit), then run this again.",
+                    L"limit-nvpstate updater", MB_ICONINFORMATION | MB_OK);
+        return EXIT_REFUSED;
     }
 
     int result = 0;
@@ -430,8 +571,8 @@ int recover(const std::wstring& appDir, HANDLE waitFor, bool show) {
         if (!updatetxn::readPhase(appDir, phase, present, error)) {
             // Never guessed: an unreadable state is not "nothing to do".
             std::wstring phaseError;
-            updatetxn::writePhase(appDir, Phase::NeedsRepair, phaseError);
             updatetxn::writeResult(appDir, error);
+            updatetxn::writePhase(appDir, Phase::NeedsRepair, phaseError);
             result = 2;
         } else if (updatetxn::hasJournal(appDir)
                    && (!present || phase == Phase::Swapping || phase == Phase::Verifying
@@ -460,9 +601,13 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
             CloseHandle(options.waitFor);
         }
 
-        return 1;
+        if (options.accepted) {
+            CloseHandle(options.accepted);
+        }
+
+        return EXIT_REFUSED;   // the program, if it started this, sees no "accepted" and says so
     }
 
-    return options.mode == Options::Mode::Install ? install(appDir, options.waitFor, options.show)
-                                                  : recover(appDir, options.waitFor, options.show);
+    return options.mode == Options::Mode::Install ? install(appDir, options.waitFor, options.accepted, options.show)
+                                                  : recover(appDir, options.waitFor, options.accepted, options.show);
 }

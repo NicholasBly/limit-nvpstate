@@ -21,3 +21,15 @@ Example: add `FortniteClient-Win64-Shipping.exe` (the game itself, not the Epic 
 - Fortnite closed: P8
 
 **Default** keeps the old behaviour: with the "Process Running" trigger a running program is unlimited, with "Process Foreground" it only counts while in front. If several listed programs count at once, the fastest (lowest) P-State wins. Any row that isn't Default makes the program watch both running processes and the foreground window, whichever trigger is selected. The same fullscreen caveat applies: a game the foreground check can't see counts as behind.
+
+## Updates
+
+**Help → Check for Updates...** looks for a newer release on this project's GitHub releases page. It only checks when you click it. If there is one, **Update now** downloads it, installs it and restarts the program.
+
+How the update is installed:
+
+- A small separate program, `limit-nvpstate-updater.exe`, swaps the files once limit-nvpstate has closed. It backs up every file it replaces first.
+- The new version then has to start and keep running for a few seconds. If it doesn't, the update is undone and the previous version starts again, with a message saying why. Your settings are put back too.
+- If the computer crashes or loses power in the middle, the next start of limit-nvpstate finishes undoing the update. If that can't be finished either, limit-nvpstate shows what to do and doesn't run until it's fixed. You can also run `limit-nvpstate-updater.exe` in the program folder yourself to undo an unfinished update.
+
+**What the update trusts:** the download comes over HTTPS from this project's GitHub releases, and its SHA-256 checksum file comes from the same release. The checksum catches a broken or incomplete download. It does **not** prove who made the release: anyone who could publish a release on this GitHub account could also publish a harmful update, and it would install with administrator rights, as limit-nvpstate itself runs with them. Releases are not code-signed. If that matters to you, download releases yourself from the releases page and check them before you run them, instead of using **Update now**.
