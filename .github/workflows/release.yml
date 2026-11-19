@@ -100,6 +100,10 @@ jobs:
         uses: ncipollo/release-action@v1
         with:
           tag: ${{ inputs.version }}
+          # Tag the commit that was built. Without this, GitHub tags the
+          # default branch -- and a release built from another branch gets
+          # a tag (and "Source code" archives) that don't match its program.
+          commit: ${{ github.sha }}
           name: limit-nvpstate v${{ inputs.version }}
           prerelease: ${{ inputs.pre-release }}
           artifacts: limit-nvpstate-${{ inputs.version }}.zip,limit-nvpstate-${{ inputs.version }}.zip.sha256
