@@ -217,9 +217,13 @@ Q_COREAPP_STARTUP_FUNCTION(install)
 // The file picker froze under Wine, so every variant's "Add" button gets this
 // stand-in instead (linked with --allow-multiple-definition; ours comes first).
 // It returns whatever "filedialog <path>" armed, once, like a user picking it.
+// MSVC links Qt as DLLs and can't replace it; the Windows job runs only the
+// update scenarios, which never pick a file.
+#ifdef __MINGW32__
 QStringList QFileDialog::getOpenFileNames(QWidget*, const QString&, const QString&, const QString&, QString*, Options) {
     QStringList picked;
     if (!armedFile.isEmpty()) picked << armedFile;
     armedFile.clear();
     return picked;
 }
+#endif
