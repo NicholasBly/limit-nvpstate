@@ -7,6 +7,11 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+    inputs:
+      scenarios:
+        description: 'Integration job: scenario names to run (blank: every update scenario)'
+        required: false
+        default: ''
 
 # Test builds only read the repo.
 permissions:
@@ -73,3 +78,74 @@ jobs:
           name: limit-nvpstate-${{ github.sha }}
           path: build\limit-nvpstate
           if-no-files-found: error
+
+  # The updater's scenarios on a real Windows machine: real NTFS, real locks,
+  # the real loader and tar, the release's own MSVC + Qt (built with test
+  # hooks; a fake NVIDIA driver, no GPU). The same scenarios run under Wine on
+  # Linux (tests/integration/README.md).
+  integration:
+    runs-on: windows-latest
+    timeout-minutes: 150
+
+    env:
+      VCPKG_DEFAULT_TRIPLET: x64-windows
+      QtMsBuild: ${{ github.workspace }}\QtMSBuild
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up MSVC environment
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Set up vcpkg
+        run: |
+          git clone https://github.com/Microsoft/vcpkg.git
+          .\vcpkg\bootstrap-vcpkg.bat
+          .\vcpkg\vcpkg.exe integrate install
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v3
+        with:
+          version: '5.14.2'
+
+      - name: Configure QtToolsPath environment variable
+        run: |
+          "QtToolsPath=$($env:Qt5_DIR)\bin" >> $env:GITHUB_ENV
+
+      - name: Install dependencies (vcpkg.json)
+        run: .\vcpkg\vcpkg.exe install
+
+      - name: Set up the MSVC command line
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Build the test versions
+        run: |
+          .\tests\integration\build_windows.ps1 -Name u3 -Mocks
+          .\tests\integration\build_windows.ps1 -Name unew3 -Version 9.9.9
+
+      - name: Run the update scenarios
+        env:
+          LIMITNV_RUNS: ${{ runner.temp }}\runs
+          SCENARIOS: ${{ github.event.inputs.scenarios }}
+          PYTHONUNBUFFERED: '1'
+        run: |
+          $ErrorActionPreference = 'Continue'   # Python's stderr is part of the log, not a step failure
+          if ($env:SCENARIOS) { $chosen = $env:SCENARIOS -split '\s+' } else { $chosen = @('--set=update') }
+          python tests\integration\runner.py @chosen --variants=u3 2>&1 | Tee-Object -FilePath "$env:RUNNER_TEMP\integration.log"
+          exit $LASTEXITCODE
+
+      - name: Upload the scenario logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-logs-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}\integration.log
+            ${{ runner.temp }}\runs
+          if-no-files-found: ignore
