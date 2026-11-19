@@ -4,8 +4,21 @@
 #include <utils.h>
 
 #include <QApplication>
+#include <QIcon>
+#include <QWinEventNotifier>
 
 #include <Windows.h>
+
+namespace {
+
+// A second launch signals this instead of hunting for the window by title.
+// FindWindow("limit-nvpstate") also matches an Explorer window opened on a
+// folder of that name, finds nothing at all while the window has never been
+// shown (Start Minimized), and ShowWindow() on it unhides the window behind
+// Qt's back so Qt still thinks it is hidden.
+constexpr wchar_t SHOW_EVENT_NAME[] = L"Local\\limit-nvpstate-show";
+
+} // namespace
 
 int main(int argc, char* argv[]) {
     QApplication::setAttribute(Qt::AA_EnableHighDpiScaling);
@@ -18,14 +31,14 @@ int main(int argc, char* argv[]) {
     const DWORD  mutexError    = GetLastError();
 
     if (!instanceMutex || mutexError == ERROR_ALREADY_EXISTS) {
-        HWND hWnd = FindWindowW(nullptr, L"limit-nvpstate");
+        const HANDLE showEvent = OpenEventW(EVENT_MODIFY_STATE, FALSE, SHOW_EVENT_NAME);
 
-        if (hWnd) {
-            // The running instance is normally hidden in the tray, and
-            // SetForegroundWindow on a hidden window does nothing. SW_RESTORE
-            // both unhides and un-minimises it.
-            ShowWindow(hWnd, SW_RESTORE);
-            SetForegroundWindow(hWnd);
+        if (showEvent) {
+            // We are the foreground process (the user just launched us), so we
+            // may hand the foreground right to the running instance.
+            AllowSetForegroundWindow(ASFW_ANY);
+            SetEvent(showEvent);
+            CloseHandle(showEvent);
         }
 
         return 0;
@@ -48,11 +61,23 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    // Qt's fallback session management closes every visible window at logoff
+    // and cancels the logoff if one refuses -- and ours always refuses, because
+    // closing hides to the tray. So an open window blocked logoff. Accepting
+    // that close instead is no better: Qt then destroys the native window, and
+    // WM_ENDSESSION, which releases the limits, never arrives. Turn it off.
+    // (Deprecated in Qt 5.15, gone in Qt 6 along with the behaviour itself.)
+    QGuiApplication::setFallbackSessionManagementEnabled(false);
+
     QApplication a(argc, argv);
 
     // This is a tray application. Without this, closing the About dialog while
     // the main window is hidden counts as "last window closed" and quits.
     a.setQuitOnLastWindowClosed(false);
+
+    // Every window (About, message boxes) inherits this. PNG rather than ICO:
+    // Qt decodes PNG itself, ICO needs the imageformats plugin build.ps1 prunes.
+    a.setWindowIcon(QIcon(":/limitnvpstate/icon.png"));
 
     limitnvpstate w;
 
@@ -60,6 +85,16 @@ int main(int argc, char* argv[]) {
     // failure returns here instead of calling exit() mid-construction.
     if (!w.init()) {
         return 1;
+    }
+
+    // Auto-reset: each SetEvent from a second launch wakes us exactly once.
+    // Created only after init() succeeded, so a launch during a failed start
+    // finds nothing to signal and just exits.
+    const HANDLE showEvent = CreateEventW(nullptr, FALSE, FALSE, SHOW_EVENT_NAME);
+
+    if (showEvent) {
+        QWinEventNotifier* notifier = new QWinEventNotifier(showEvent, &w);
+        QObject::connect(notifier, &QWinEventNotifier::activated, &w, [&w]() { w.bringToFront(); });
     }
 
     if (!config["start_minimized"].get<bool>()) {

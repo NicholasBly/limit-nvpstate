@@ -14,14 +14,7 @@ constexpr unsigned int NVAPI_ID_SET_PSTATE_CLIENT_LIMITS = 0xFDFC7D49;
 HMODULE                       hNvAPI               = nullptr;
 NvAPISetPstateClientLimitsPtr pfnSetPstateLimits   = nullptr;
 
-// Serialises the read-modify-write on isPStateUnlimited together with the
-// NVAPI call itself. Uncontended acquisition is a few nanoseconds and this is
-// called at most a handful of times per minute.
-SRWLOCK pStateLock = SRWLOCK_INIT;
-
 } // namespace
-
-std::atomic<bool> isPStateUnlimited{ true };
 
 int initNvAPI() {
     if (NvAPI_Initialize() != 0) {
@@ -34,8 +27,11 @@ int initNvAPI() {
     // extra refcount that is never released.
     hNvAPI = GetModuleHandleW(L"nvapi64.dll");
 
+    // Fallback only. The driver installs nvapi64.dll in System32, so never
+    // let the ordinary search order (which starts with our own folder) pick
+    // up some other file of that name in an elevated process.
     if (!hNvAPI) {
-        hNvAPI = LoadLibraryW(L"nvapi64.dll");
+        hNvAPI = LoadLibraryExW(L"nvapi64.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
     }
 
     if (!hNvAPI) {
@@ -64,35 +60,18 @@ int initNvAPI() {
     return 0;
 }
 
-int setPState(NvPhysicalGpuHandle hPhysicalGpu, bool isUnlimit, unsigned int pStateLimit, bool force) {
+int setPStateLimit(NvPhysicalGpuHandle hPhysicalGpu, unsigned int limit) {
     if (!pfnSetPstateLimits || !hPhysicalGpu) {
-        return 1;
+        return NVAPI_INVALID_ARGUMENT;
     }
 
-    // Fast path: already in the requested state and no forced re-apply. This is
-    // the common case when alt-tabbing between two non-excepted applications,
-    // and it avoids touching the lock at all.
-    if (!force && isPStateUnlimited.load(std::memory_order_acquire) == isUnlimit) {
-        return 0;
+    const int status = static_cast<int>(pfnSetPstateLimits(hPhysicalGpu, NV_PSTATE_CLIENT_LIMIT_TYPE, limit));
+
+    if (status != NVAPI_OK) {
+        LOG(L"error: NvAPI_GPU_SetPstateClientLimits(P%u) failed (%d)\n", limit, status);
+        return status;
     }
 
-    AcquireSRWLockExclusive(&pStateLock);
-
-    int result = 0;
-
-    if (force || isPStateUnlimited.load(std::memory_order_relaxed) != isUnlimit) {
-        const unsigned int limit = isUnlimit ? 0u : pStateLimit;
-
-        if (pfnSetPstateLimits(hPhysicalGpu, NV_PSTATE_CLIENT_LIMIT_TYPE, limit) != 0) {
-            LOG(L"error: NvAPI_GPU_SetPstateClientLimits failed\n");
-            result = 1;
-        } else {
-            LOG(L"info: set P%u\n", limit);
-            isPStateUnlimited.store(isUnlimit, std::memory_order_release);
-        }
-    }
-
-    ReleaseSRWLockExclusive(&pStateLock);
-
-    return result;
+    LOG(L"info: set P%u\n", limit);
+    return NVAPI_OK;
 }

@@ -34,7 +34,7 @@ function Invoke-Build {
         -p:Platform=x64 `
         -m `
         -nologo `
-        -v:minimal
+        -v:minimal | Out-Host
 
     if ($LASTEXITCODE -ne 0) {
         Write-Host "error: build failed (exit code $LASTEXITCODE)" -ForegroundColor Red
@@ -62,7 +62,7 @@ function Invoke-Build {
         --no-virtualkeyboard `
         --no-quick-import `
         --no-webkit2 `
-        --no-compiler-runtime
+        --no-compiler-runtime | Out-Host
 
     if ($LASTEXITCODE -ne 0) {
         Write-Host "error: windeployqt failed (exit code $LASTEXITCODE)" -ForegroundColor Red
@@ -103,6 +103,9 @@ function Invoke-Build {
     return 0
 }
 
+# Everything above writes with Write-Host/Out-Host, so the only thing on the
+# output stream is the return code. (Before, MSBuild's output was captured into
+# $exitCode: errors were never shown and the step could not fail.)
 $exitCode = Invoke-Build
 Write-Host
-exit $exitCode
+exit ([int]($exitCode | Select-Object -Last 1))

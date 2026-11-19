@@ -92,7 +92,7 @@
       <LanguageStandard>stdcpp17</LanguageStandard>
       <ConformanceMode>true</ConformanceMode>
       <WarningLevel>Level3</WarningLevel>
-      <SDLCheck>false</SDLCheck>
+      <SDLCheck>true</SDLCheck>
       <PreprocessorDefinitions>NDEBUG;WIN32_LEAN_AND_MEAN;NOMINMAX;QT_NO_DEBUG;QT_NO_DEBUG_OUTPUT;QT_NO_INFO_OUTPUT;QT_NO_WARNING_OUTPUT;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <AdditionalOptions>/Gw /Zc:inline /utf-8 %(AdditionalOptions)</AdditionalOptions>
       <AdditionalIncludeDirectories>%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
@@ -135,6 +135,7 @@
     <ClCompile Include="about.cpp" />
     <ClCompile Include="config.cpp" />
     <ClCompile Include="nvidia.cpp" />
+    <ClCompile Include="pstatepolicy.cpp" />
     <ClCompile Include="utils.cpp" />
     <QtRcc Include="limitnvpstate.qrc" />
     <QtUic Include="about.ui" />
@@ -148,6 +149,7 @@
     <ClInclude Include="config.h" />
     <ClInclude Include="log.h" />
     <ClInclude Include="nvidia.h" />
+    <ClInclude Include="pstatepolicy.h" />
     <ClInclude Include="resource.h" />
     <ClInclude Include="utils.h" />
   </ItemGroup>
